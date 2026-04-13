@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: trading-bot
+    env: python
+    buildCommand: ""
+    startCommand: "python app.py"
