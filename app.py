@@ -6,17 +6,12 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# =========================
-# Environment variables
-# =========================
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")  # Gmail App Password
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 TO_EMAIL = os.getenv("TO_EMAIL", EMAIL_ADDRESS)
 PORT = int(os.getenv("PORT", "10000"))
 
-
 def validate_env() -> None:
-    """Make sure required environment variables are present."""
     missing = []
 
     if not EMAIL_ADDRESS:
@@ -26,12 +21,10 @@ def validate_env() -> None:
 
     if missing:
         raise RuntimeError(
-            f"Missing required environment variables: {', '.join(missing)}"
+            "Missing required environment variables: " + ", ".join(missing)
         )
 
-
 def send_email(subject: str, body: str) -> None:
-    """Send an email using Gmail SMTP over SSL."""
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = EMAIL_ADDRESS
@@ -41,16 +34,13 @@ def send_email(subject: str, body: str) -> None:
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.send_message(msg)
 
-
 @app.route("/", methods=["GET"])
 def home():
     return "Trading bot is running", 200
 
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -85,7 +75,11 @@ def webhook():
         print(f"Webhook error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
 if __name__ == "__main__":
-    validate_env()
+    try:
+        validate_env()
+    except Exception as e:
+        print(f"Startup configuration error: {e}")
+        raise
+
     app.run(host="0.0.0.0", port=PORT)
