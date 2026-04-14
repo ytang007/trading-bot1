@@ -9,8 +9,8 @@ app = Flask(__name__)
 # =========================
 # Environment variables
 # =========================
-EMAIL_ADDRESS = os.getenv("ytang06@gmail.com")
-EMAIL_PASSWORD = os.getenv("rnjwlxiiqdwxdjmt")  # Gmail App Password
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")  # Gmail App Password
 TO_EMAIL = os.getenv("TO_EMAIL", EMAIL_ADDRESS)
 PORT = int(os.getenv("PORT", "10000"))
 
