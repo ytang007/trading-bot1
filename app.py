@@ -12,19 +12,23 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # =========================
-# Environment / Config
+# Config
 # =========================
 PORT = int(os.getenv("PORT", "10000"))
 
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")  # Gmail app password
 TO_EMAIL = os.getenv("TO_EMAIL", EMAIL_ADDRESS)
-
-CSV_LOG = os.getenv("CSV_LOG", "alerts_log.csv")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional
 ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "true").lower() == "true"
 
-# Email queue so webhook returns fast
+CSV_LOG = os.getenv("CSV_LOG", "alerts_log.csv")
+
+# scanner state
+scanner_scores = {}
+last_summary_sent = 0
+SUMMARY_INTERVAL_SECONDS = 300  # 5 minutes
+
+# queue email so webhook returns fast
 email_queue: queue.Queue[dict] = queue.Queue()
 
 
@@ -42,11 +46,8 @@ def validate_env() -> None:
             missing.append("EMAIL_ADDRESS")
         if not EMAIL_PASSWORD:
             missing.append("EMAIL_PASSWORD")
-
     if missing:
-        raise RuntimeError(
-            "Missing required environment variables: " + ", ".join(missing)
-        )
+        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
 
 def ensure_csv_exists() -> None:
@@ -85,7 +86,6 @@ def send_email(subject: str, body: str) -> None:
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = TO_EMAIL
 
-    # Gmail SSL SMTP
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.send_message(msg)
@@ -99,32 +99,38 @@ def email_worker() -> None:
                 send_email(job["subject"], job["body"])
                 print(f"[EMAIL SENT] {job['subject']}")
             else:
-                print(f"[EMAIL SKIPPED] {job['subject']}")
+                print(f"[EMAIL DISABLED] {job['subject']}")
         except Exception as e:
             print(f"[EMAIL ERROR] {e}")
         finally:
             email_queue.task_done()
 
 
-def format_email(data: dict) -> tuple[str, str]:
-    symbol = str(data.get("symbol", "UNKNOWN"))
-    alert_type = str(data.get("type", "UNKNOWN"))
-    price = str(data.get("price", "0"))
-    alert_time = str(data.get("time", "UNKNOWN"))
-
-    subject = f"{alert_type} - {symbol}"
-    body = (
-        f"TradingView Alert Received\n\n"
-        f"Symbol: {symbol}\n"
-        f"Type: {alert_type}\n"
-        f"Price: {price}\n"
-        f"Time: {alert_time}\n\n"
-        f"Raw JSON:\n{json.dumps(data, indent=2)}\n"
-    )
-    return subject, body
+def enqueue_email(subject: str, body: str) -> None:
+    email_queue.put({"subject": subject, "body": body})
 
 
-# Start background email thread once
+def send_scanner_summary_if_due() -> None:
+    global last_summary_sent
+    now = time.time()
+    if now - last_summary_sent < SUMMARY_INTERVAL_SECONDS:
+        return
+    if not scanner_scores:
+        return
+
+    top5 = sorted(scanner_scores.items(), key=lambda x: x[1]["score"], reverse=True)[:5]
+
+    lines = ["TOP 5 RIGHT NOW", ""]
+    for i, (symbol, data) in enumerate(top5, 1):
+        lines.append(f"{i}. {symbol} — {data['score']}/9")
+        lines.append(f"   Intraday: {data['intraday']}  Pre: {data['pre']}")
+        lines.append(f"   Price: {data['price']}")
+        lines.append("")
+
+    enqueue_email("Scanner Top 5", "\n".join(lines))
+    last_summary_sent = now
+
+
 worker_thread = threading.Thread(target=email_worker, daemon=True)
 worker_thread.start()
 
@@ -139,24 +145,19 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "time_utc": utc_now_iso(),
-        "email_enabled": ENABLE_EMAIL
-    }), 200
+    return jsonify({"status": "ok", "time_utc": utc_now_iso(), "email_enabled": ENABLE_EMAIL}), 200
+
+
+@app.route("/test-email", methods=["GET"])
+def test_email():
+    enqueue_email("Trading Bot Test", "This is a test email from your Render bot.")
+    return jsonify({"status": "ok", "message": "Test email queued"}), 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     start = time.time()
-
     try:
-        # Optional secret protection
-        if WEBHOOK_SECRET:
-            incoming_secret = request.headers.get("X-Webhook-Secret", "")
-            if incoming_secret != WEBHOOK_SECRET:
-                return jsonify({"status": "error", "message": "Unauthorized"}), 401
-
         if not request.is_json:
             return jsonify({"status": "error", "message": "Expected JSON body"}), 400
 
@@ -172,57 +173,61 @@ def webhook():
         print("[WEBHOOK RECEIVED]")
         print(json.dumps(data, indent=2))
 
-        # Log immediately
-        log_alert(
-            symbol=symbol,
-            alert_type=alert_type,
-            price=price,
-            alert_time=alert_time,
-            status="received",
-            raw_data=data
-        )
+        log_alert(symbol, alert_type, price, alert_time, "received", data)
 
-        # Queue email so the webhook can return fast
-        subject, body = format_email(data)
-        email_queue.put({
-            "subject": subject,
-            "body": body
-        })
+        # Scanner alerts
+        if alert_type == "SCANNER_TOP_STOCK":
+            score = int(float(data.get("score", 0)))
+            intraday = int(float(data.get("intraday", 0)))
+            pre = int(float(data.get("pre", 0)))
+
+            scanner_scores[symbol] = {
+                "score": score,
+                "intraday": intraday,
+                "pre": pre,
+                "price": price,
+                "last_update": utc_now_iso()
+            }
+            send_scanner_summary_if_due()
+
+        elif alert_type == "ENTRY_READY":
+            score = data.get("score", "?")
+            intraday = data.get("intraday", "?")
+            pre = data.get("pre", "?")
+            stop = data.get("stop", "?")
+            target = data.get("target", "?")
+
+            subject = f"ENTRY READY - {symbol}"
+            body = (
+                f"ENTRY READY\n\n"
+                f"Symbol: {symbol}\n"
+                f"Score: {score}/9\n"
+                f"Intraday: {intraday}\n"
+                f"Pre: {pre}\n"
+                f"Current price: {price}\n"
+                f"Suggested stop: {stop}\n"
+                f"Suggested target: {target}\n"
+            )
+            enqueue_email(subject, body)
+
+        # Management alerts
+        else:
+            subject = f"{alert_type} - {symbol}"
+            body = (
+                f"Trading Alert\n\n"
+                f"Symbol: {symbol}\n"
+                f"Type: {alert_type}\n"
+                f"Price: {price}\n"
+                f"Time: {alert_time}\n"
+            )
+            enqueue_email(subject, body)
 
         elapsed_ms = int((time.time() - start) * 1000)
-        return jsonify({
-            "status": "ok",
-            "message": "Webhook received",
-            "elapsed_ms": elapsed_ms
-        }), 200
+        return jsonify({"status": "ok", "elapsed_ms": elapsed_ms}), 200
 
     except Exception as e:
         print(f"[WEBHOOK ERROR] {e}")
-        try:
-            raw = request.get_json(silent=True) or {}
-            log_alert(
-                symbol=str(raw.get("symbol", "UNKNOWN")),
-                alert_type=str(raw.get("type", "UNKNOWN")),
-                price=str(raw.get("price", "0")),
-                alert_time=str(raw.get("time", "UNKNOWN")),
-                status=f"error: {e}",
-                raw_data=raw if isinstance(raw, dict) else {}
-            )
-        except Exception:
-            pass
-
         return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@app.route("/test-email", methods=["GET"])
-def test_email():
-    if not ENABLE_EMAIL:
-        return jsonify({"status": "ok", "message": "Email disabled"}), 200
-
-    subject = "Trading Bot Test Email"
-    body = "This is a test email from your Render trading bot."
-    email_queue.put({"subject": subject, "body": body})
-    return jsonify({"status": "ok", "message": "Test email queued"}), 200
 
 
 if __name__ == "__main__":
