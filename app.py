@@ -23,20 +23,24 @@ ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "true").lower() == "true"
 
 CSV_LOG = os.getenv("CSV_LOG", "alerts_log.csv")
 
-# scanner state
+# Scanner state
 scanner_scores = {}
 last_summary_sent = 0
 SUMMARY_INTERVAL_SECONDS = 300  # 5 minutes
+scanner_day = None  # used to reset scanner every new UTC day
 
-# background email queue
+# Background email queue
 email_queue = queue.Queue()
-
 
 # =========================
 # Helpers
 # =========================
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def validate_env() -> None:
@@ -113,6 +117,33 @@ def enqueue_email(subject: str, body: str) -> None:
     email_queue.put({"subject": subject, "body": body})
 
 
+def reset_scanner_scores_if_new_day() -> None:
+    global scanner_scores, scanner_day
+    today = utc_now().date().isoformat()
+    if scanner_day != today:
+        scanner_scores = {}
+        scanner_day = today
+        print(f"[SCANNER RESET] New day detected: {today}")
+
+
+def update_scanner_score(symbol: str, price: str) -> None:
+    reset_scanner_scores_if_new_day()
+    now_iso = utc_now_iso()
+
+    if symbol not in scanner_scores:
+        scanner_scores[symbol] = {
+            "score": 1,
+            "hits": 1,
+            "price": price,
+            "last_update": now_iso
+        }
+    else:
+        scanner_scores[symbol]["hits"] += 1
+        scanner_scores[symbol]["score"] = scanner_scores[symbol]["hits"]
+        scanner_scores[symbol]["price"] = price
+        scanner_scores[symbol]["last_update"] = now_iso
+
+
 def send_scanner_summary_if_due() -> None:
     global last_summary_sent
 
@@ -123,30 +154,30 @@ def send_scanner_summary_if_due() -> None:
     if not scanner_scores:
         return
 
+    # Sort by score first, then most recent update
     top5 = sorted(
         scanner_scores.items(),
-        key=lambda item: item[1]["score"],
+        key=lambda item: (item[1]["score"], item[1]["last_update"]),
         reverse=True
     )[:5]
 
     lines = [
-        "TOP 5 RIGHT NOW",
+        "TOP 5 SCANNER (LIVE ACTIVITY)",
         "",
-        "Scanner Engine V2 uses:",
-        "- EMA trend",
-        "- VWAP",
-        "- Volume",
-        "- RSI filter",
+        "Ranking basis:",
+        "- More scanner hits = higher score",
+        "- More recent updates rank higher when scores tie",
         ""
     ]
 
     for i, (symbol, data) in enumerate(top5, 1):
-        lines.append(f"{i}. {symbol} — Score: {data['score']}")
+        lines.append(f"{i}. {symbol} | Score: {data['score']}")
         lines.append(f"   Price: {data['price']}")
+        lines.append(f"   Hits: {data['hits']}")
         lines.append(f"   Last update: {data['last_update']}")
         lines.append("")
 
-    enqueue_email("Scanner Top 5", "\n".join(lines))
+    enqueue_email("Top 5 Scanner Stocks", "\n".join(lines))
     last_summary_sent = now
 
 
@@ -162,10 +193,9 @@ def build_general_email(symbol: str, alert_type: str, price: str, alert_time: st
     return subject, body
 
 
-# start background email thread
+# Start background email thread
 worker_thread = threading.Thread(target=email_worker, daemon=True)
 worker_thread.start()
-
 
 # =========================
 # Routes
@@ -181,7 +211,8 @@ def health():
         "status": "ok",
         "time_utc": utc_now_iso(),
         "email_enabled": ENABLE_EMAIL,
-        "scanner_symbols_tracked": len(scanner_scores)
+        "scanner_symbols_tracked": len(scanner_scores),
+        "scanner_day": scanner_day
     }), 200
 
 
@@ -227,11 +258,7 @@ def webhook():
         # Scanner Engine alerts
         # =========================
         if alert_type == "SCANNER_TOP_STOCK":
-            scanner_scores[symbol] = {
-                "score": "TOP_STOCK",
-                "price": price,
-                "last_update": utc_now_iso()
-            }
+            update_scanner_score(symbol, price)
             send_scanner_summary_if_due()
 
         elif alert_type == "ENTRY_READY":
@@ -241,10 +268,7 @@ def webhook():
                 f"Symbol: {symbol}\n"
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
-                f"Scanner Engine V2 notes:\n"
-                f"- RSI-enhanced scanner passed\n"
-                f"- trend/volume/VWAP conditions passed\n\n"
-                f"This symbol is considered entry-ready.\n"
+                f"This symbol passed the scanner and is considered entry-ready.\n"
             )
             enqueue_email(subject, body)
 
@@ -259,7 +283,6 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"This is a buy setup alert from the Entry Engine.\n"
-                f"Entry Engine uses EMA + VWAP + volume.\n"
             )
             enqueue_email(subject, body)
 
@@ -273,8 +296,7 @@ def webhook():
                 f"Symbol: {symbol}\n"
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
-                f"Management Engine V2 says trend remains intact.\n"
-                f"ATR-based stop logic is still active.\n"
+                f"Trend remains intact according to the Management Engine.\n"
             )
             enqueue_email(subject, body)
 
@@ -286,7 +308,8 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"The trade has reached the target checkpoint.\n"
-                f"Management Engine V2 now shifts focus to ATR-based trailing protection.\n"
+                f"Do not automatically sell unless your rules say so.\n"
+                f"Use trailing-stop / trend rules from the Management Engine.\n"
             )
             enqueue_email(subject, body)
 
@@ -298,7 +321,6 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"The initial stop-loss condition was triggered.\n"
-                f"This stop comes from the ATR-based Management Engine.\n"
             )
             enqueue_email(subject, body)
 
@@ -309,7 +331,7 @@ def webhook():
                 f"Symbol: {symbol}\n"
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
-                f"The ATR-based trailing stop condition was triggered.\n"
+                f"The trailing stop condition was triggered.\n"
             )
             enqueue_email(subject, body)
 
@@ -321,7 +343,6 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"The trend is weakening according to the Management Engine.\n"
-                f"VWAP and EMA conditions no longer support holding.\n"
             )
             enqueue_email(subject, body)
 
@@ -372,4 +393,5 @@ def webhook():
 if __name__ == "__main__":
     validate_env()
     ensure_csv_exists()
+    reset_scanner_scores_if_new_day()
     app.run(host="0.0.0.0", port=PORT)
