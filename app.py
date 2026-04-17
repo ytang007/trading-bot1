@@ -5,7 +5,7 @@ import time
 import queue
 import threading
 import smtplib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from flask import Flask, request, jsonify
 
@@ -27,7 +27,7 @@ CSV_LOG = os.getenv("CSV_LOG", "alerts_log.csv")
 scanner_scores = {}
 last_summary_sent = 0
 SUMMARY_INTERVAL_SECONDS = 300  # 5 minutes
-scanner_day = None  # used to reset scanner every new UTC day
+ROLLING_WINDOW_MINUTES = 30
 
 # Background email queue
 email_queue = queue.Queue()
@@ -117,31 +117,39 @@ def enqueue_email(subject: str, body: str) -> None:
     email_queue.put({"subject": subject, "body": body})
 
 
-def reset_scanner_scores_if_new_day() -> None:
-    global scanner_scores, scanner_day
-    today = utc_now().date().isoformat()
-    if scanner_day != today:
-        scanner_scores = {}
-        scanner_day = today
-        print(f"[SCANNER RESET] New day detected: {today}")
+def prune_old_hits() -> None:
+    """Keep only scanner hits from the rolling window."""
+    cutoff = utc_now() - timedelta(minutes=ROLLING_WINDOW_MINUTES)
+    symbols_to_delete = []
+
+    for symbol, data in scanner_scores.items():
+        kept_hits = [hit for hit in data["hits"] if hit >= cutoff]
+        data["hits"] = kept_hits
+        data["score"] = len(kept_hits)
+
+        if not kept_hits:
+            symbols_to_delete.append(symbol)
+
+    for symbol in symbols_to_delete:
+        del scanner_scores[symbol]
 
 
 def update_scanner_score(symbol: str, price: str) -> None:
-    reset_scanner_scores_if_new_day()
-    now_iso = utc_now_iso()
+    now_dt = utc_now()
 
     if symbol not in scanner_scores:
         scanner_scores[symbol] = {
+            "hits": [now_dt],
             "score": 1,
-            "hits": 1,
             "price": price,
-            "last_update": now_iso
+            "last_update": now_dt.isoformat()
         }
     else:
-        scanner_scores[symbol]["hits"] += 1
-        scanner_scores[symbol]["score"] = scanner_scores[symbol]["hits"]
+        scanner_scores[symbol]["hits"].append(now_dt)
         scanner_scores[symbol]["price"] = price
-        scanner_scores[symbol]["last_update"] = now_iso
+        scanner_scores[symbol]["last_update"] = now_dt.isoformat()
+
+    prune_old_hits()
 
 
 def send_scanner_summary_if_due() -> None:
@@ -151,10 +159,12 @@ def send_scanner_summary_if_due() -> None:
     if now - last_summary_sent < SUMMARY_INTERVAL_SECONDS:
         return
 
+    prune_old_hits()
+
     if not scanner_scores:
         return
 
-    # Sort by score first, then most recent update
+    # Sort by rolling-window score first, then recency
     top5 = sorted(
         scanner_scores.items(),
         key=lambda item: (item[1]["score"], item[1]["last_update"]),
@@ -162,10 +172,10 @@ def send_scanner_summary_if_due() -> None:
     )[:5]
 
     lines = [
-        "TOP 5 SCANNER (LIVE ACTIVITY)",
+        f"TOP 5 SCANNER (LAST {ROLLING_WINDOW_MINUTES} MINUTES)",
         "",
         "Ranking basis:",
-        "- More scanner hits = higher score",
+        f"- Scanner hits in the last {ROLLING_WINDOW_MINUTES} minutes",
         "- More recent updates rank higher when scores tie",
         ""
     ]
@@ -173,7 +183,6 @@ def send_scanner_summary_if_due() -> None:
     for i, (symbol, data) in enumerate(top5, 1):
         lines.append(f"{i}. {symbol} | Score: {data['score']}")
         lines.append(f"   Price: {data['price']}")
-        lines.append(f"   Hits: {data['hits']}")
         lines.append(f"   Last update: {data['last_update']}")
         lines.append("")
 
@@ -207,12 +216,13 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
+    prune_old_hits()
     return jsonify({
         "status": "ok",
         "time_utc": utc_now_iso(),
         "email_enabled": ENABLE_EMAIL,
         "scanner_symbols_tracked": len(scanner_scores),
-        "scanner_day": scanner_day
+        "rolling_window_minutes": ROLLING_WINDOW_MINUTES
     }), 200
 
 
@@ -308,7 +318,6 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"The trade has reached the target checkpoint.\n"
-                f"Do not automatically sell unless your rules say so.\n"
                 f"Use trailing-stop / trend rules from the Management Engine.\n"
             )
             enqueue_email(subject, body)
@@ -357,9 +366,6 @@ def webhook():
             )
             enqueue_email(subject, body)
 
-        # =========================
-        # Fallback
-        # =========================
         else:
             subject, body = build_general_email(symbol, alert_type, price, alert_time)
             enqueue_email(subject, body)
@@ -393,5 +399,4 @@ def webhook():
 if __name__ == "__main__":
     validate_env()
     ensure_csv_exists()
-    reset_scanner_scores_if_new_day()
     app.run(host="0.0.0.0", port=PORT)
