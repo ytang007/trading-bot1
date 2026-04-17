@@ -31,6 +31,7 @@ SUMMARY_INTERVAL_SECONDS = 300  # 5 minutes
 # background email queue
 email_queue = queue.Queue()
 
+
 # =========================
 # Helpers
 # =========================
@@ -128,9 +129,19 @@ def send_scanner_summary_if_due() -> None:
         reverse=True
     )[:5]
 
-    lines = ["TOP 5 RIGHT NOW", ""]
+    lines = [
+        "TOP 5 RIGHT NOW",
+        "",
+        "Scanner Engine V2 uses:",
+        "- EMA trend",
+        "- VWAP",
+        "- Volume",
+        "- RSI filter",
+        ""
+    ]
+
     for i, (symbol, data) in enumerate(top5, 1):
-        lines.append(f"{i}. {symbol} — {data['score']}")
+        lines.append(f"{i}. {symbol} — Score: {data['score']}")
         lines.append(f"   Price: {data['price']}")
         lines.append(f"   Last update: {data['last_update']}")
         lines.append("")
@@ -154,6 +165,7 @@ def build_general_email(symbol: str, alert_type: str, price: str, alert_time: st
 # start background email thread
 worker_thread = threading.Thread(target=email_worker, daemon=True)
 worker_thread.start()
+
 
 # =========================
 # Routes
@@ -229,7 +241,10 @@ def webhook():
                 f"Symbol: {symbol}\n"
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
-                f"This symbol passed the scanner and is considered entry-ready.\n"
+                f"Scanner Engine V2 notes:\n"
+                f"- RSI-enhanced scanner passed\n"
+                f"- trend/volume/VWAP conditions passed\n\n"
+                f"This symbol is considered entry-ready.\n"
             )
             enqueue_email(subject, body)
 
@@ -244,6 +259,7 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"This is a buy setup alert from the Entry Engine.\n"
+                f"Entry Engine uses EMA + VWAP + volume.\n"
             )
             enqueue_email(subject, body)
 
@@ -257,7 +273,8 @@ def webhook():
                 f"Symbol: {symbol}\n"
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
-                f"Trend remains intact according to the Management Engine.\n"
+                f"Management Engine V2 says trend remains intact.\n"
+                f"ATR-based stop logic is still active.\n"
             )
             enqueue_email(subject, body)
 
@@ -269,8 +286,7 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"The trade has reached the target checkpoint.\n"
-                f"Do not automatically sell unless your rules say so.\n"
-                f"Use trailing-stop / trend rules from the Management Engine.\n"
+                f"Management Engine V2 now shifts focus to ATR-based trailing protection.\n"
             )
             enqueue_email(subject, body)
 
@@ -282,6 +298,7 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"The initial stop-loss condition was triggered.\n"
+                f"This stop comes from the ATR-based Management Engine.\n"
             )
             enqueue_email(subject, body)
 
@@ -292,7 +309,7 @@ def webhook():
                 f"Symbol: {symbol}\n"
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
-                f"The trailing stop condition was triggered.\n"
+                f"The ATR-based trailing stop condition was triggered.\n"
             )
             enqueue_email(subject, body)
 
@@ -304,6 +321,7 @@ def webhook():
                 f"Current price: {price}\n"
                 f"Time: {alert_time}\n\n"
                 f"The trend is weakening according to the Management Engine.\n"
+                f"VWAP and EMA conditions no longer support holding.\n"
             )
             enqueue_email(subject, body)
 
