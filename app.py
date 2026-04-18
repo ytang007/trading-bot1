@@ -30,13 +30,13 @@ TOP_N = 5
 
 NY_TZ = ZoneInfo("America/New_York")
 
-# Rolling activity scanner state
-scanner_scores = {}
+# Unified scanner state
+unified_scanner = {}
 
-# Quality scanner state
-quality_scores = {}
-
+# Email timing
 last_summary_sent = 0
+
+# Background email queue
 email_queue = queue.Queue()
 
 # =========================
@@ -45,22 +45,27 @@ email_queue = queue.Queue()
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def ny_now() -> datetime:
     return datetime.now(NY_TZ)
+
 
 def utc_now_iso() -> str:
     return utc_now().isoformat()
 
+
 def ny_now_str() -> str:
     return ny_now().strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
+
 def iso_utc_to_ny_str(iso_text: str) -> str:
     """
-    Convert incoming ISO-like UTC time text to New York display time.
-    If conversion fails, return original string.
+    Convert incoming ISO-like UTC text to New York time string.
+    If parsing fails, return original text.
     """
     if not iso_text or iso_text == "UNKNOWN":
         return iso_text
+
     try:
         cleaned = iso_text.replace("Z", "+00:00")
         dt = datetime.fromisoformat(cleaned)
@@ -77,6 +82,7 @@ def validate_env():
     if ENABLE_EMAIL and (not EMAIL_ADDRESS or not EMAIL_PASSWORD):
         raise RuntimeError("Missing EMAIL credentials")
 
+
 def ensure_csv():
     if not os.path.exists(CSV_LOG):
         with open(CSV_LOG, "w", newline="") as f:
@@ -91,6 +97,7 @@ def ensure_csv():
                 "status",
                 "raw_json"
             ])
+
 
 def log_alert(symbol, alert_type, price, alert_time_raw, status, raw):
     ensure_csv()
@@ -107,6 +114,7 @@ def log_alert(symbol, alert_type, price, alert_time_raw, status, raw):
             json.dumps(raw, separators=(",", ":"))
         ])
 
+
 def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -116,6 +124,7 @@ def send_email(subject, body):
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.send_message(msg)
+
 
 def email_worker():
     while True:
@@ -131,135 +140,136 @@ def email_worker():
         finally:
             email_queue.task_done()
 
+
 threading.Thread(target=email_worker, daemon=True).start()
+
 
 def enqueue_email(subject, body):
     email_queue.put({"subject": subject, "body": body})
 
 # =========================
-# ROLLING TOP 5 SCANNER
+# UNIFIED SCANNER
 # =========================
-def prune_scanner_hits():
+def prune_unified_scanner_hits():
     cutoff = utc_now() - timedelta(minutes=ROLLING_WINDOW_MINUTES)
 
     remove = []
-    for sym, data in scanner_scores.items():
+    for sym, data in unified_scanner.items():
         data["hits"] = [h for h in data["hits"] if h >= cutoff]
-        data["score"] = len(data["hits"])
+        data["activity_score"] = len(data["hits"])
+
         if not data["hits"]:
             remove.append(sym)
 
     for r in remove:
-        del scanner_scores[r]
+        del unified_scanner[r]
 
-def update_scanner_score(symbol, price):
+
+def update_unified_scanner(symbol, alert_type, price):
+    """
+    SCANNER_TOP_STOCK  -> quality_score = 1
+    SCANNER_ELITE_STOCK -> quality_score = 2
+    """
     now = utc_now()
+    quality_score = 2 if alert_type == "SCANNER_ELITE_STOCK" else 1
 
-    if symbol not in scanner_scores:
-        scanner_scores[symbol] = {
+    if symbol not in unified_scanner:
+        unified_scanner[symbol] = {
             "hits": [now],
-            "score": 1,
+            "activity_score": 1,
+            "quality_score": quality_score,
+            "tier": alert_type,
             "price": price,
             "last": now.isoformat()
         }
     else:
-        scanner_scores[symbol]["hits"].append(now)
-        scanner_scores[symbol]["price"] = price
-        scanner_scores[symbol]["last"] = now.isoformat()
+        unified_scanner[symbol]["hits"].append(now)
+        unified_scanner[symbol]["activity_score"] = len(unified_scanner[symbol]["hits"])
+        unified_scanner[symbol]["quality_score"] = max(
+            unified_scanner[symbol]["quality_score"],
+            quality_score
+        )
+        if alert_type == "SCANNER_ELITE_STOCK":
+            unified_scanner[symbol]["tier"] = alert_type
+        unified_scanner[symbol]["price"] = price
+        unified_scanner[symbol]["last"] = now.isoformat()
 
-    prune_scanner_hits()
+    prune_unified_scanner_hits()
 
-def get_top_symbols():
-    prune_scanner_hits()
-    ranked = sorted(
-        scanner_scores.items(),
-        key=lambda x: (x[1]["score"], x[1]["last"]),
-        reverse=True
-    )[:TOP_N]
-    return [s for s, _ in ranked]
 
-def in_top(symbol):
-    return symbol in get_top_symbols()
-
-# =========================
-# QUALITY SCANNER
-# =========================
-def update_quality_score(symbol, quality_type, price, raw):
-    """
-    Because Pine alertcondition messages can't easily carry dynamic numeric scores
-    in your current setup, we treat QUALITY_TOP_STOCK > QUALITY_WATCH_STOCK.
-    """
-    now = utc_now()
-
-    score_value = 2 if quality_type == "QUALITY_TOP_STOCK" else 1
-
-    quality_scores[symbol] = {
-        "quality_label": quality_type,
-        "quality_score": score_value,
-        "price": price,
-        "last": now.isoformat(),
-        "raw": raw
-    }
-
-def get_quality_ranked_symbols():
-    ranked = sorted(
-        quality_scores.items(),
-        key=lambda x: (x[1]["quality_score"], x[1]["last"]),
+def get_unified_ranked():
+    prune_unified_scanner_hits()
+    return sorted(
+        unified_scanner.items(),
+        key=lambda x: (
+            x[1]["quality_score"],   # elite first
+            x[1]["activity_score"],  # then most active
+            x[1]["last"]             # then most recent
+        ),
         reverse=True
     )
-    return ranked
+
+
+def get_unified_top_symbols():
+    ranked = get_unified_ranked()[:TOP_N]
+    return [symbol for symbol, _ in ranked]
+
+
+def in_unified_top(symbol):
+    return symbol in get_unified_top_symbols()
 
 # =========================
-# SUMMARY EMAILS
+# SUMMARY EMAIL
 # =========================
-def send_combined_summary_if_due():
+def send_unified_scanner_summary_if_due():
     global last_summary_sent
 
     now = time.time()
     if now - last_summary_sent < SUMMARY_INTERVAL_SECONDS:
         return
 
-    prune_scanner_hits()
+    ranked = get_unified_ranked()
 
-    top_activity = sorted(
-        scanner_scores.items(),
-        key=lambda x: (x[1]["score"], x[1]["last"]),
-        reverse=True
-    )[:TOP_N]
+    if not ranked:
+        return
 
-    top_quality = get_quality_ranked_symbols()[:TOP_N]
+    elite = [(s, d) for s, d in ranked if d["quality_score"] == 2][:TOP_N]
+    top_only = [(s, d) for s, d in ranked if d["quality_score"] == 1][:TOP_N]
 
     lines = [
-        f"Hybrid Scanner Summary",
+        "Unified Scanner Summary",
         f"Generated: {ny_now_str()}",
         "",
-        f"Top {TOP_N} Active Stocks (last {ROLLING_WINDOW_MINUTES} minutes):",
-        ""
+        "Elite Picks"
     ]
 
-    if top_activity:
-        for i, (s, d) in enumerate(top_activity, 1):
-            lines.append(f"{i}. {s} | Activity Score: {d['score']} | Price: {d['price']}")
+    if elite:
+        for i, (s, d) in enumerate(elite, 1):
+            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}")
     else:
-        lines.append("No active scanner symbols yet.")
+        lines.append("None")
 
-    lines.extend(["", f"Top {TOP_N} Quality Stocks:", ""])
+    lines.extend(["", "Top Stocks"])
 
-    if top_quality:
-        for i, (s, d) in enumerate(top_quality, 1):
-            lines.append(f"{i}. {s} | {d['quality_label']} | Quality Score: {d['quality_score']} | Price: {d['price']}")
+    if top_only:
+        for i, (s, d) in enumerate(top_only, 1):
+            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}")
     else:
-        lines.append("No quality scanner symbols yet.")
+        lines.append("None")
 
     lines.extend([
         "",
-        "Interpretation:",
-        "- Activity Score = scanner hits in last 30 minutes",
-        "- Quality Score = 2 for QUALITY_TOP_STOCK, 1 for QUALITY_WATCH_STOCK",
-        "- Entry alerts are filtered so only current Top 5 activity names can pass"
+        "How to use this:",
+        "- Elite Picks = focus first",
+        "- Top Stocks = secondary watchlist",
+        "- Wait for ENTRY_READY or ENTRY_LONG before buying",
+        "",
+        "Scoring notes:",
+        f"- Activity Score = hits in last {ROLLING_WINDOW_MINUTES} minutes",
+        "- Elite outranks Top when all else is equal"
     ])
 
-    enqueue_email("Hybrid Scanner Summary", "\n".join(lines))
+    enqueue_email("Unified Scanner Summary", "\n".join(lines))
     last_summary_sent = now
 
 # =========================
@@ -269,20 +279,32 @@ def send_combined_summary_if_due():
 def home():
     return "running"
 
+
 @app.route("/health")
 def health():
     return {
         "time_ny": ny_now_str(),
-        "top_activity_symbols": get_top_symbols(),
-        "quality_symbols": [s for s, _ in get_quality_ranked_symbols()[:TOP_N]],
-        "scanner_tracked": len(scanner_scores),
-        "quality_tracked": len(quality_scores),
+        "top_symbols": get_unified_top_symbols(),
+        "tracked": len(unified_scanner)
     }
+
+
+@app.route("/test-email")
+def test_email():
+    enqueue_email(
+        "Trading Bot Test",
+        f"This is a test email.\nGenerated: {ny_now_str()}"
+    )
+    return {"ok": True, "message": "test email queued"}
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json()
+
+        if not isinstance(data, dict):
+            return {"error": "invalid json"}, 400
 
         symbol = data.get("symbol", "UNK")
         alert_type = data.get("type", "UNK")
@@ -295,25 +317,18 @@ def webhook():
         log_alert(symbol, alert_type, price, alert_time_raw, "ok", data)
 
         # =========================
-        # ACTIVITY SCANNER
+        # UNIFIED SCANNER
         # =========================
-        if alert_type == "SCANNER_TOP_STOCK":
-            update_scanner_score(symbol, price)
-            send_combined_summary_if_due()
-
-        # =========================
-        # QUALITY SCANNER
-        # =========================
-        elif alert_type in ["QUALITY_TOP_STOCK", "QUALITY_WATCH_STOCK"]:
-            update_quality_score(symbol, alert_type, price, data)
-            send_combined_summary_if_due()
+        if alert_type in ["SCANNER_TOP_STOCK", "SCANNER_ELITE_STOCK"]:
+            update_unified_scanner(symbol, alert_type, price)
+            send_unified_scanner_summary_if_due()
 
         # =========================
         # ENTRY FILTER
-        # Only allow entry alerts if current symbol is in Top 5 activity
+        # Only allow entry alerts if symbol is in unified Top 5
         # =========================
         elif alert_type == "ENTRY_READY":
-            if in_top(symbol):
+            if in_unified_top(symbol):
                 enqueue_email(
                     f"ENTRY READY - {symbol}",
                     f"ENTRY READY\n\n"
@@ -321,13 +336,13 @@ def webhook():
                     f"Price: {price}\n"
                     f"Alert Time (NY): {alert_time_ny}\n"
                     f"Received Time (NY): {ny_now_str()}\n\n"
-                    f"This symbol is currently in the Top {TOP_N} activity scanner."
+                    f"This symbol is currently in the unified scanner Top {TOP_N}."
                 )
             else:
                 print("FILTERED ENTRY_READY:", symbol)
 
         elif alert_type == "ENTRY_LONG":
-            if in_top(symbol):
+            if in_unified_top(symbol):
                 enqueue_email(
                     f"ENTRY LONG - {symbol}",
                     f"ENTRY LONG\n\n"
@@ -335,7 +350,7 @@ def webhook():
                     f"Price: {price}\n"
                     f"Alert Time (NY): {alert_time_ny}\n"
                     f"Received Time (NY): {ny_now_str()}\n\n"
-                    f"This symbol is currently in the Top {TOP_N} activity scanner."
+                    f"This symbol is currently in the unified scanner Top {TOP_N}."
                 )
             else:
                 print("FILTERED ENTRY_LONG:", symbol)
@@ -453,6 +468,7 @@ def webhook():
     except Exception as e:
         print("ERROR:", e)
         return {"error": str(e)}, 500
+
 
 if __name__ == "__main__":
     validate_env()
