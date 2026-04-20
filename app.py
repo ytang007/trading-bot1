@@ -354,6 +354,19 @@ def webhook():
                 )
             else:
                 print("FILTERED ENTRY_LONG:", symbol)
+        elif alert_type == "ELITE_EARLY":
+            if in_unified_top(symbol):
+                enqueue_email(
+                f"ELITE EARLY - {symbol}",
+                f"ELITE EARLY ENTRY\n\n"
+                f"Symbol: {symbol}\n"
+                f"Price: {price}\n"
+                f"Alert Time (NY): {alert_time_ny}\n"
+                f"Received Time (NY): {ny_now_str()}\n\n"
+                f"Top {TOP_N} filtered early entry signal."
+                )
+            else:
+                print("FILTERED ELITE_EARLY:", symbol)
 
         # =========================
         # MANAGEMENT ALERTS
