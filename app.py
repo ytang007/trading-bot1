@@ -9,7 +9,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
-from flask import Flask, request, jsonify
+from flask import Flask, request
 
 app = Flask(__name__)
 
@@ -26,7 +26,7 @@ ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "true").lower() == "true"
 CSV_LOG = os.getenv("CSV_LOG", "alerts_log.csv")
 
 ROLLING_WINDOW_MINUTES = 30
-SUMMARY_INTERVAL_SECONDS = 900
+SUMMARY_INTERVAL_SECONDS = 1800   # 30 minutes
 TOP_N = 5
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -147,7 +147,7 @@ def enqueue_email(subject, body):
     email_queue.put({"subject": subject, "body": body})
 
 # =========================
-# UNIFIED SCANNER
+# UNIFIED SCANNER STATE / RANKING
 # =========================
 def refresh_unified_scanner_rankings():
     global cached_unified_ranked, cached_top_symbols, cached_top_symbol_set
@@ -155,10 +155,11 @@ def refresh_unified_scanner_rankings():
     cached_unified_ranked = sorted(
         unified_scanner.items(),
         key=lambda x: (
-            x[1]["quality_score"],                 # elite first
-            x[1].get("early_leader_score", 0),    # then early leader boost
-            x[1]["activity_score"],               # then activity
-            x[1]["last"]                          # then recency
+            x[1].get("premarket_score", 0),      # premarket first
+            x[1]["quality_score"],               # elite/top intraday
+            x[1].get("early_leader_score", 0),   # early leader boost
+            x[1]["activity_score"],              # rolling activity
+            x[1]["last"]                         # recency
         ),
         reverse=True
     )
@@ -173,6 +174,7 @@ def prune_unified_scanner_hits(now=None):
     remove = []
     for sym, data in list(unified_scanner.items()):
         hits = data["hits"]
+
         while hits and hits[0] < cutoff:
             hits.popleft()
             changed = True
@@ -182,11 +184,14 @@ def prune_unified_scanner_hits(now=None):
             data["activity_score"] = new_activity_score
             changed = True
 
-        if not hits and data.get("quality_score", 0) == 0 and data.get("early_leader_score", 0) == 0:
+        # Keep symbols if they still have useful non-activity metadata
+        if (
+            not hits
+            and data.get("quality_score", 0) == 0
+            and data.get("early_leader_score", 0) == 0
+            and data.get("premarket_score", 0) == 0
+        ):
             remove.append(sym)
-        elif not hits and data.get("activity_score", 0) == 0:
-            # keep early leader-only names briefly if they still have metadata
-            pass
 
     for r in remove:
         del unified_scanner[r]
@@ -208,6 +213,8 @@ def update_unified_scanner(symbol, alert_type, price):
                 "activity_score": 1,
                 "quality_score": quality_score,
                 "early_leader_score": 0,
+                "premarket_score": 0,
+                "premarket_tier": "",
                 "tier": alert_type,
                 "price": price,
                 "last": now.isoformat()
@@ -238,12 +245,48 @@ def update_early_leader(symbol, price):
                 "activity_score": 0,
                 "quality_score": 0,
                 "early_leader_score": 1,
+                "premarket_score": 0,
+                "premarket_tier": "",
                 "tier": "EARLY_LEADER",
                 "price": price,
                 "last": now.isoformat()
             }
         else:
             unified_scanner[symbol]["early_leader_score"] = 1
+            unified_scanner[symbol]["price"] = price
+            unified_scanner[symbol]["last"] = now.isoformat()
+
+        refresh_unified_scanner_rankings()
+
+def update_premarket_symbol(symbol, alert_type, price):
+    now = utc_now()
+    premarket_score = 2 if alert_type == "PREMARKET_ELITE" else 1
+
+    with unified_scanner_lock:
+        prune_unified_scanner_hits(now)
+
+        if symbol not in unified_scanner:
+            unified_scanner[symbol] = {
+                "hits": deque(),
+                "activity_score": 0,
+                "quality_score": 0,
+                "early_leader_score": 0,
+                "premarket_score": premarket_score,
+                "premarket_tier": alert_type,
+                "tier": alert_type,
+                "price": price,
+                "last": now.isoformat()
+            }
+        else:
+            unified_scanner[symbol]["premarket_score"] = max(
+                unified_scanner[symbol].get("premarket_score", 0),
+                premarket_score
+            )
+            if alert_type == "PREMARKET_ELITE":
+                unified_scanner[symbol]["premarket_tier"] = alert_type
+            elif not unified_scanner[symbol].get("premarket_tier"):
+                unified_scanner[symbol]["premarket_tier"] = alert_type
+
             unified_scanner[symbol]["price"] = price
             unified_scanner[symbol]["last"] = now.isoformat()
 
@@ -287,38 +330,58 @@ def send_unified_scanner_summary_if_due():
     if not ranked:
         return
 
-    elite = [(s, d) for s, d in ranked if d["quality_score"] == 2][:TOP_N]
-    top_only = [(s, d) for s, d in ranked if d["quality_score"] == 1][:TOP_N]
+    premarket_elite = [(s, d) for s, d in ranked if d.get("premarket_score", 0) == 2][:TOP_N]
+    premarket_top = [(s, d) for s, d in ranked if d.get("premarket_score", 0) == 1][:TOP_N]
+    elite = [(s, d) for s, d in ranked if d.get("quality_score", 0) == 2][:TOP_N]
+    top_only = [(s, d) for s, d in ranked if d.get("quality_score", 0) == 1][:TOP_N]
 
     lines = [
         "Unified Scanner Summary",
         f"Generated: {ny_now_str()}",
-        "",
-        "Elite Picks"
+        ""
     ]
 
+    lines.append("Premarket Elite")
+    if premarket_elite:
+        for i, (s, d) in enumerate(premarket_elite, 1):
+            early_tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
+            lines.append(f"{i}. {s} | Price: {d['price']}{early_tag}")
+    else:
+        lines.append("None")
+
+    lines.extend(["", "Premarket Top"])
+    if premarket_top:
+        for i, (s, d) in enumerate(premarket_top, 1):
+            early_tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
+            lines.append(f"{i}. {s} | Price: {d['price']}{early_tag}")
+    else:
+        lines.append("None")
+
+    lines.extend(["", "Elite Picks"])
     if elite:
         for i, (s, d) in enumerate(elite, 1):
-            tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
-            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{tag}")
+            early_tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
+            pm_tag = f" | {d.get('premarket_tier')}" if d.get("premarket_tier") else ""
+            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{pm_tag}{early_tag}")
     else:
         lines.append("None")
 
     lines.extend(["", "Top Stocks"])
-
     if top_only:
         for i, (s, d) in enumerate(top_only, 1):
-            tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
-            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{tag}")
+            early_tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
+            pm_tag = f" | {d.get('premarket_tier')}" if d.get("premarket_tier") else ""
+            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{pm_tag}{early_tag}")
     else:
         lines.append("None")
 
     lines.extend([
         "",
         "How to use this:",
-        "- Elite Picks = focus first",
-        "- Early Leader tag = pressure building early",
-        "- Top Stocks = secondary watchlist",
+        "- Premarket Elite = strongest names before 9:30",
+        "- Premarket Top = secondary premarket watchlist",
+        "- Early Leader = pressure building after the open",
+        "- Elite Picks = strongest confirmed intraday names",
         "- Wait for ENTRY_LONG to execute",
         "- ELITE_EARLY = starter position only"
     ])
@@ -368,9 +431,25 @@ def webhook():
         log_alert(symbol, alert_type, price, alert_time_raw, "ok", data)
 
         # =========================
-        # UNIFIED SCANNER
+        # PREMARKET
         # =========================
-        if alert_type in ["SCANNER_TOP_STOCK", "SCANNER_ELITE_STOCK"]:
+        if alert_type in ["PREMARKET_TOP", "PREMARKET_ELITE"]:
+            update_premarket_symbol(symbol, alert_type, price)
+            enqueue_email(
+                f"{alert_type.replace('_', ' ')} - {symbol}",
+                f"{alert_type}\n\n"
+                f"Symbol: {symbol}\n"
+                f"Price: {price}\n"
+                f"Alert Time (NY): {alert_time_ny}\n"
+                f"Received Time (NY): {ny_now_str()}\n\n"
+                f"This stock is ranking highly in the premarket scan."
+            )
+            send_unified_scanner_summary_if_due()
+
+        # =========================
+        # INTRADAY SCANNER
+        # =========================
+        elif alert_type in ["SCANNER_TOP_STOCK", "SCANNER_ELITE_STOCK"]:
             update_unified_scanner(symbol, alert_type, price)
             send_unified_scanner_summary_if_due()
 
@@ -538,6 +617,9 @@ def webhook():
                 f"Review whether to reduce exposure or exit before the close."
             )
 
+        # =========================
+        # FALLBACK
+        # =========================
         else:
             enqueue_email(
                 f"{alert_type} - {symbol}",
@@ -554,6 +636,7 @@ def webhook():
     except Exception as e:
         print("ERROR:", e)
         return {"error": str(e)}, 500
+
 
 if __name__ == "__main__":
     validate_env()
