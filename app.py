@@ -13,9 +13,9 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# =========================
+# =====================================================
 # CONFIG
-# =========================
+# =====================================================
 PORT = int(os.getenv("PORT", "10000"))
 
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
@@ -31,37 +31,40 @@ TOP_N = 5
 
 NY_TZ = ZoneInfo("America/New_York")
 
-# Unified scanner state
-unified_scanner = {}
-unified_scanner_lock = threading.Lock()
-cached_unified_ranked = []
+# =====================================================
+# GLOBAL STATE
+# =====================================================
+scanner_state = {}
+scanner_lock = threading.Lock()
+
+cached_ranked = []
 cached_top_symbols = []
 cached_top_symbol_set = set()
-
-last_summary_sent = 0
 
 email_queue = queue.Queue()
 csv_ready = False
 csv_lock = threading.Lock()
 
-# =========================
+last_summary_sent = 0
+
+# =====================================================
 # TIME HELPERS
-# =========================
+# =====================================================
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 def ny_now() -> datetime:
     return datetime.now(NY_TZ)
 
-def utc_now_iso() -> str:
-    return utc_now().isoformat()
-
 def ny_now_str() -> str:
     return ny_now().strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
+def utc_now_iso() -> str:
+    return utc_now().isoformat()
+
 def iso_utc_to_ny_str(iso_text: str) -> str:
-    if not iso_text or iso_text == "UNKNOWN":
-        return iso_text
+    if not iso_text:
+        return "UNKNOWN"
     try:
         cleaned = iso_text.replace("Z", "+00:00")
         dt = datetime.fromisoformat(cleaned)
@@ -71,9 +74,9 @@ def iso_utc_to_ny_str(iso_text: str) -> str:
     except Exception:
         return iso_text
 
-# =========================
-# GENERAL HELPERS
-# =========================
+# =====================================================
+# CSV / EMAIL
+# =====================================================
 def validate_env():
     if ENABLE_EMAIL and (not EMAIL_ADDRESS or not EMAIL_PASSWORD):
         raise RuntimeError("Missing EMAIL credentials")
@@ -97,27 +100,25 @@ def ensure_csv():
                     "type",
                     "price",
                     "alert_time_ny",
-                    "status",
                     "raw_json"
                 ])
         csv_ready = True
 
-def log_alert(symbol, alert_type, price, alert_time_raw, status, raw):
+def log_event(event: dict):
     ensure_csv()
     with open(CSV_LOG, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
             ny_now_str(),
             utc_now_iso(),
-            symbol,
-            alert_type,
-            price,
-            iso_utc_to_ny_str(alert_time_raw),
-            status,
-            json.dumps(raw, separators=(",", ":"))
+            event["symbol"],
+            event["type"],
+            event["price"],
+            event["alert_time_ny"],
+            json.dumps(event["raw"], separators=(",", ":"))
         ])
 
-def send_email(subject, body):
+def send_email(subject: str, body: str):
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = EMAIL_ADDRESS
@@ -143,235 +144,202 @@ def email_worker():
 
 threading.Thread(target=email_worker, daemon=True).start()
 
-def enqueue_email(subject, body):
+def enqueue_email(subject: str, body: str):
     email_queue.put({"subject": subject, "body": body})
 
-# =========================
-# UNIFIED SCANNER STATE / RANKING
-# =========================
-def refresh_unified_scanner_rankings():
-    global cached_unified_ranked, cached_top_symbols, cached_top_symbol_set
+# =====================================================
+# EVENT NORMALIZATION
+# =====================================================
+def normalize_event(data: dict) -> dict:
+    symbol = str(data.get("symbol", "UNK"))
+    alert_type = str(data.get("type", "UNK"))
+    price = str(data.get("price", "0"))
+    alert_time_raw = str(data.get("time", "UNKNOWN"))
 
-    cached_unified_ranked = sorted(
-        unified_scanner.items(),
-        key=lambda x: (
-            x[1].get("premarket_score", 0),      # premarket first
-            x[1]["quality_score"],               # elite/top intraday
-            x[1].get("early_leader_score", 0),   # early leader boost
-            x[1]["activity_score"],              # rolling activity
-            x[1]["last"]                         # recency
-        ),
-        reverse=True
-    )
-    cached_top_symbols = [symbol for symbol, _ in cached_unified_ranked[:TOP_N]]
-    cached_top_symbol_set = set(cached_top_symbols)
+    return {
+        "symbol": symbol,
+        "type": alert_type,
+        "price": price,
+        "alert_time_raw": alert_time_raw,
+        "alert_time_ny": iso_utc_to_ny_str(alert_time_raw),
+        "received_time_ny": ny_now_str(),
+        "raw": data,
+    }
 
-def prune_unified_scanner_hits(now=None):
+# =====================================================
+# SCANNER STATE
+# =====================================================
+def _new_state_record(price: str, now: datetime):
+    return {
+        "hits": deque(),
+        "activity_score": 0,
+        "quality_score": 0,
+        "premarket_score": 0,
+        "premarket_tier": "",
+        "early_leader_score": 0,
+        "price": price,
+        "last": now.isoformat(),
+    }
+
+def prune_scanner_state(now=None):
     now = now or utc_now()
     cutoff = now - timedelta(minutes=ROLLING_WINDOW_MINUTES)
     changed = False
-
     remove = []
-    for sym, data in list(unified_scanner.items()):
-        hits = data["hits"]
 
-        while hits and hits[0] < cutoff:
-            hits.popleft()
+    for symbol, rec in list(scanner_state.items()):
+        while rec["hits"] and rec["hits"][0] < cutoff:
+            rec["hits"].popleft()
             changed = True
 
-        new_activity_score = len(hits)
-        if data["activity_score"] != new_activity_score:
-            data["activity_score"] = new_activity_score
+        new_activity = len(rec["hits"])
+        if rec["activity_score"] != new_activity:
+            rec["activity_score"] = new_activity
             changed = True
 
-        # Keep symbols if they still have useful non-activity metadata
         if (
-            not hits
-            and data.get("quality_score", 0) == 0
-            and data.get("early_leader_score", 0) == 0
-            and data.get("premarket_score", 0) == 0
+            rec["activity_score"] == 0
+            and rec["quality_score"] == 0
+            and rec["premarket_score"] == 0
+            and rec["early_leader_score"] == 0
         ):
-            remove.append(sym)
+            remove.append(symbol)
 
-    for r in remove:
-        del unified_scanner[r]
+    for symbol in remove:
+        del scanner_state[symbol]
         changed = True
 
     if changed:
-        refresh_unified_scanner_rankings()
+        refresh_rankings()
 
-def update_unified_scanner(symbol, alert_type, price):
-    now = utc_now()
-    quality_score = 2 if alert_type == "SCANNER_ELITE_STOCK" else 1
+def refresh_rankings():
+    global cached_ranked, cached_top_symbols, cached_top_symbol_set
 
-    with unified_scanner_lock:
-        prune_unified_scanner_hits(now)
+    cached_ranked = sorted(
+        scanner_state.items(),
+        key=lambda x: (
+            x[1]["premarket_score"],
+            x[1]["quality_score"],
+            x[1]["early_leader_score"],
+            x[1]["activity_score"],
+            x[1]["last"]
+        ),
+        reverse=True
+    )
 
-        if symbol not in unified_scanner:
-            unified_scanner[symbol] = {
-                "hits": deque([now]),
-                "activity_score": 1,
-                "quality_score": quality_score,
-                "early_leader_score": 0,
-                "premarket_score": 0,
-                "premarket_tier": "",
-                "tier": alert_type,
-                "price": price,
-                "last": now.isoformat()
-            }
-        else:
-            unified_scanner[symbol]["hits"].append(now)
-            unified_scanner[symbol]["activity_score"] = len(unified_scanner[symbol]["hits"])
-            unified_scanner[symbol]["quality_score"] = max(
-                unified_scanner[symbol]["quality_score"],
-                quality_score
-            )
-            if alert_type == "SCANNER_ELITE_STOCK":
-                unified_scanner[symbol]["tier"] = alert_type
-            unified_scanner[symbol]["price"] = price
-            unified_scanner[symbol]["last"] = now.isoformat()
+    cached_top_symbols = [symbol for symbol, _ in cached_ranked[:TOP_N]]
+    cached_top_symbol_set = set(cached_top_symbols)
 
-        refresh_unified_scanner_rankings()
+def get_ranked():
+    with scanner_lock:
+        prune_scanner_state()
+        return list(cached_ranked)
 
-def update_early_leader(symbol, price):
-    now = utc_now()
-
-    with unified_scanner_lock:
-        prune_unified_scanner_hits(now)
-
-        if symbol not in unified_scanner:
-            unified_scanner[symbol] = {
-                "hits": deque(),
-                "activity_score": 0,
-                "quality_score": 0,
-                "early_leader_score": 1,
-                "premarket_score": 0,
-                "premarket_tier": "",
-                "tier": "EARLY_LEADER",
-                "price": price,
-                "last": now.isoformat()
-            }
-        else:
-            unified_scanner[symbol]["early_leader_score"] = 1
-            unified_scanner[symbol]["price"] = price
-            unified_scanner[symbol]["last"] = now.isoformat()
-
-        refresh_unified_scanner_rankings()
-
-def update_premarket_symbol(symbol, alert_type, price):
-    now = utc_now()
-    premarket_score = 2 if alert_type == "PREMARKET_ELITE" else 1
-
-    with unified_scanner_lock:
-        prune_unified_scanner_hits(now)
-
-        if symbol not in unified_scanner:
-            unified_scanner[symbol] = {
-                "hits": deque(),
-                "activity_score": 0,
-                "quality_score": 0,
-                "early_leader_score": 0,
-                "premarket_score": premarket_score,
-                "premarket_tier": alert_type,
-                "tier": alert_type,
-                "price": price,
-                "last": now.isoformat()
-            }
-        else:
-            unified_scanner[symbol]["premarket_score"] = max(
-                unified_scanner[symbol].get("premarket_score", 0),
-                premarket_score
-            )
-            if alert_type == "PREMARKET_ELITE":
-                unified_scanner[symbol]["premarket_tier"] = alert_type
-            elif not unified_scanner[symbol].get("premarket_tier"):
-                unified_scanner[symbol]["premarket_tier"] = alert_type
-
-            unified_scanner[symbol]["price"] = price
-            unified_scanner[symbol]["last"] = now.isoformat()
-
-        refresh_unified_scanner_rankings()
-
-def get_unified_ranked():
-    with unified_scanner_lock:
-        prune_unified_scanner_hits()
-        return list(cached_unified_ranked)
-
-def get_unified_top_symbols():
-    with unified_scanner_lock:
-        prune_unified_scanner_hits()
+def get_top_symbols():
+    with scanner_lock:
+        prune_scanner_state()
         return list(cached_top_symbols)
 
-def in_unified_top(symbol):
-    with unified_scanner_lock:
-        prune_unified_scanner_hits()
+def in_top(symbol: str) -> bool:
+    with scanner_lock:
+        prune_scanner_state()
         return symbol in cached_top_symbol_set
 
-def get_unified_tracked_count():
-    with unified_scanner_lock:
-        prune_unified_scanner_hits()
-        return len(unified_scanner)
+def update_scanner_state(event: dict):
+    now = utc_now()
+    symbol = event["symbol"]
+    alert_type = event["type"]
+    price = event["price"]
 
-def is_elite(symbol):
-    with unified_scanner_lock:
-        return symbol in unified_scanner and unified_scanner[symbol].get("quality_score", 0) == 2
+    with scanner_lock:
+        prune_scanner_state(now)
 
-# =========================
-# SUMMARY EMAIL
-# =========================
-def send_unified_scanner_summary_if_due():
+        if symbol not in scanner_state:
+            scanner_state[symbol] = _new_state_record(price, now)
+
+        rec = scanner_state[symbol]
+        rec["price"] = price
+        rec["last"] = now.isoformat()
+
+        if alert_type == "SCANNER_TOP_STOCK":
+            rec["hits"].append(now)
+            rec["activity_score"] = len(rec["hits"])
+            rec["quality_score"] = max(rec["quality_score"], 1)
+
+        elif alert_type == "SCANNER_ELITE_STOCK":
+            rec["hits"].append(now)
+            rec["activity_score"] = len(rec["hits"])
+            rec["quality_score"] = max(rec["quality_score"], 2)
+
+        elif alert_type == "PREMARKET_TOP":
+            rec["premarket_score"] = max(rec["premarket_score"], 1)
+            if not rec["premarket_tier"]:
+                rec["premarket_tier"] = "PREMARKET_TOP"
+
+        elif alert_type == "PREMARKET_ELITE":
+            rec["premarket_score"] = max(rec["premarket_score"], 2)
+            rec["premarket_tier"] = "PREMARKET_ELITE"
+
+        elif alert_type == "EARLY_LEADER":
+            rec["early_leader_score"] = 1
+
+        refresh_rankings()
+
+# =====================================================
+# EMAIL TEMPLATES
+# =====================================================
+def send_scanner_summary_if_due():
     global last_summary_sent
-
     now = time.time()
     if now - last_summary_sent < SUMMARY_INTERVAL_SECONDS:
         return
 
-    ranked = get_unified_ranked()
+    ranked = get_ranked()
     if not ranked:
         return
 
-    premarket_elite = [(s, d) for s, d in ranked if d.get("premarket_score", 0) == 2][:TOP_N]
-    premarket_top = [(s, d) for s, d in ranked if d.get("premarket_score", 0) == 1][:TOP_N]
-    elite = [(s, d) for s, d in ranked if d.get("quality_score", 0) == 2][:TOP_N]
-    top_only = [(s, d) for s, d in ranked if d.get("quality_score", 0) == 1][:TOP_N]
+    premarket_elite = [(s, d) for s, d in ranked if d["premarket_score"] == 2][:TOP_N]
+    premarket_top = [(s, d) for s, d in ranked if d["premarket_score"] == 1][:TOP_N]
+    elite = [(s, d) for s, d in ranked if d["quality_score"] == 2][:TOP_N]
+    top_only = [(s, d) for s, d in ranked if d["quality_score"] == 1][:TOP_N]
 
     lines = [
         "Unified Scanner Summary",
         f"Generated: {ny_now_str()}",
-        ""
+        "",
+        "Premarket Elite"
     ]
 
-    lines.append("Premarket Elite")
     if premarket_elite:
         for i, (s, d) in enumerate(premarket_elite, 1):
-            early_tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
-            lines.append(f"{i}. {s} | Price: {d['price']}{early_tag}")
+            early = " | Early Leader" if d["early_leader_score"] == 1 else ""
+            lines.append(f"{i}. {s} | Price: {d['price']}{early}")
     else:
         lines.append("None")
 
     lines.extend(["", "Premarket Top"])
     if premarket_top:
         for i, (s, d) in enumerate(premarket_top, 1):
-            early_tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
-            lines.append(f"{i}. {s} | Price: {d['price']}{early_tag}")
+            early = " | Early Leader" if d["early_leader_score"] == 1 else ""
+            lines.append(f"{i}. {s} | Price: {d['price']}{early}")
     else:
         lines.append("None")
 
     lines.extend(["", "Elite Picks"])
     if elite:
         for i, (s, d) in enumerate(elite, 1):
-            early_tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
-            pm_tag = f" | {d.get('premarket_tier')}" if d.get("premarket_tier") else ""
-            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{pm_tag}{early_tag}")
+            pm = f" | {d['premarket_tier']}" if d["premarket_tier"] else ""
+            early = " | Early Leader" if d["early_leader_score"] == 1 else ""
+            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{pm}{early}")
     else:
         lines.append("None")
 
     lines.extend(["", "Top Stocks"])
     if top_only:
         for i, (s, d) in enumerate(top_only, 1):
-            early_tag = " | Early Leader" if d.get("early_leader_score", 0) == 1 else ""
-            pm_tag = f" | {d.get('premarket_tier')}" if d.get("premarket_tier") else ""
-            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{pm_tag}{early_tag}")
+            pm = f" | {d['premarket_tier']}" if d["premarket_tier"] else ""
+            early = " | Early Leader" if d["early_leader_score"] == 1 else ""
+            lines.append(f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{pm}{early}")
     else:
         lines.append("None")
 
@@ -389,9 +357,180 @@ def send_unified_scanner_summary_if_due():
     enqueue_email("Unified Scanner Summary", "\n".join(lines))
     last_summary_sent = now
 
-# =========================
+def email_for_event(event: dict):
+    t = event["type"]
+    s = event["symbol"]
+    p = event["price"]
+    at = event["alert_time_ny"]
+    rt = event["received_time_ny"]
+
+    if t in ("PREMARKET_TOP", "PREMARKET_ELITE"):
+        return (
+            f"{t.replace('_', ' ')} - {s}",
+            f"{t}\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"This stock is ranking highly in the premarket scan."
+        )
+
+    if t == "EARLY_LEADER":
+        return (
+            f"EARLY LEADER - {s}",
+            f"EARLY LEADER\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"This stock is showing early leadership characteristics.\n"
+            f"Watch for ELITE_EARLY or ENTRY_LONG."
+        )
+
+    if t == "ENTRY_READY":
+        return (
+            f"ENTRY READY - {s}",
+            f"ENTRY READY\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"This symbol is currently in the unified scanner Top {TOP_N}."
+        )
+
+    if t == "ENTRY_LONG":
+        return (
+            f"ENTRY LONG - {s}",
+            f"ENTRY LONG\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"This symbol is currently in the unified scanner Top {TOP_N}."
+        )
+
+    if t == "ELITE_EARLY":
+        return (
+            f"ELITE EARLY - {s}",
+            f"ELITE EARLY\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"This symbol is currently in the unified scanner Top {TOP_N}."
+        )
+
+    if t == "HOLD_OK":
+        return (f"HOLD - {s}", f"HOLD\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "TARGET_CHECKPOINT_HIT":
+        return (f"TARGET CHECKPOINT - {s}", f"TARGET CHECKPOINT HIT\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "SELL_INITIAL_STOP":
+        return (f"SELL INITIAL STOP - {s}", f"SELL INITIAL STOP\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "SELL_TRAILING_STOP":
+        return (f"SELL TRAILING STOP - {s}", f"SELL TRAILING STOP\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "SELL_TREND_WEAKENING":
+        return (f"SELL TREND WEAKENING - {s}", f"SELL TREND WEAKENING\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "SELL_END_OF_DAY":
+        return (f"SELL EOD - {s}", f"SELL END OF DAY\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "HOLD_OVERNIGHT":
+        return (f"HOLD OVERNIGHT - {s}", f"HOLD OVERNIGHT\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "HOLD_OVER_WEEKEND":
+        return (f"HOLD OVER WEEKEND - {s}", f"HOLD OVER WEEKEND\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "SELL_BEFORE_WEEKEND":
+        return (f"SELL BEFORE WEEKEND - {s}", f"SELL BEFORE WEEKEND\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n")
+
+    if t == "LATE_DAY_RISK_OFF":
+        return (
+            f"LATE-DAY RISK OFF - {s}",
+            f"LATE-DAY RISK OFF\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"Late-day weakness is developing.\n"
+            f"Review whether to reduce exposure or exit before the close."
+        )
+
+    return (
+        f"{t} - {s}",
+        f"GENERAL ALERT\n\n"
+        f"Symbol: {s}\n"
+        f"Price: {p}\n"
+        f"Alert Time (NY): {at}\n"
+        f"Received Time (NY): {rt}\n\n"
+        f"Raw Payload:\n{json.dumps(event['raw'], indent=2)}"
+    )
+
+# =====================================================
+# ROUTING
+# =====================================================
+SCANNER_TYPES = {
+    "PREMARKET_TOP",
+    "PREMARKET_ELITE",
+    "SCANNER_TOP_STOCK",
+    "SCANNER_ELITE_STOCK",
+    "EARLY_LEADER",
+}
+
+ENTRY_TYPES = {"ENTRY_READY", "ENTRY_LONG", "ELITE_EARLY"}
+
+MANAGEMENT_TYPES = {
+    "HOLD_OK",
+    "TARGET_CHECKPOINT_HIT",
+    "SELL_INITIAL_STOP",
+    "SELL_TRAILING_STOP",
+    "SELL_TREND_WEAKENING",
+    "SELL_END_OF_DAY",
+    "HOLD_OVERNIGHT",
+    "HOLD_OVER_WEEKEND",
+    "SELL_BEFORE_WEEKEND",
+    "LATE_DAY_RISK_OFF",
+}
+
+def handle_scanner_event(event: dict):
+    update_scanner_state(event)
+
+    if event["type"] in {"PREMARKET_TOP", "PREMARKET_ELITE", "EARLY_LEADER"}:
+        subject, body = email_for_event(event)
+        enqueue_email(subject, body)
+
+    send_scanner_summary_if_due()
+
+def handle_entry_event(event: dict):
+    if in_top(event["symbol"]):
+        subject, body = email_for_event(event)
+        enqueue_email(subject, body)
+    else:
+        print(f"[FILTERED {event['type']}] {event['symbol']} not in Top {TOP_N}")
+
+def handle_management_event(event: dict):
+    subject, body = email_for_event(event)
+    enqueue_email(subject, body)
+
+def route_event(event: dict):
+    t = event["type"]
+
+    if t in SCANNER_TYPES:
+        handle_scanner_event(event)
+    elif t in ENTRY_TYPES:
+        handle_entry_event(event)
+    elif t in MANAGEMENT_TYPES:
+        handle_management_event(event)
+    else:
+        subject, body = email_for_event(event)
+        enqueue_email(subject, body)
+
+# =====================================================
 # ROUTES
-# =========================
+# =====================================================
 @app.route("/")
 def home():
     return "running"
@@ -400,16 +539,13 @@ def home():
 def health():
     return {
         "time_ny": ny_now_str(),
-        "top_symbols": get_unified_top_symbols(),
-        "tracked": get_unified_tracked_count()
+        "top_symbols": get_top_symbols(),
+        "tracked": len(get_ranked())
     }
 
 @app.route("/test-email")
 def test_email():
-    enqueue_email(
-        "Trading Bot Test",
-        f"This is a test email.\nGenerated: {ny_now_str()}"
-    )
+    enqueue_email("Trading Bot Test", f"This is a test email.\nGenerated: {ny_now_str()}")
     return {"ok": True, "message": "test email queued"}
 
 @app.route("/webhook", methods=["POST"])
@@ -420,223 +556,16 @@ def webhook():
         if not isinstance(data, dict):
             return {"error": "invalid json"}, 400
 
-        symbol = data.get("symbol", "UNK")
-        alert_type = data.get("type", "UNK")
-        price = str(data.get("price", "0"))
-        alert_time_raw = str(data.get("time", "UNKNOWN"))
-        alert_time_ny = iso_utc_to_ny_str(alert_time_raw)
+        event = normalize_event(data)
+        print(f"[RECV] {event['symbol']} {event['type']} {event['price']}")
 
-        print("RECV:", data)
-
-        log_alert(symbol, alert_type, price, alert_time_raw, "ok", data)
-
-        # =========================
-        # PREMARKET
-        # =========================
-        if alert_type in ["PREMARKET_TOP", "PREMARKET_ELITE"]:
-            update_premarket_symbol(symbol, alert_type, price)
-            enqueue_email(
-                f"{alert_type.replace('_', ' ')} - {symbol}",
-                f"{alert_type}\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n\n"
-                f"This stock is ranking highly in the premarket scan."
-            )
-            send_unified_scanner_summary_if_due()
-
-        # =========================
-        # INTRADAY SCANNER
-        # =========================
-        elif alert_type in ["SCANNER_TOP_STOCK", "SCANNER_ELITE_STOCK"]:
-            update_unified_scanner(symbol, alert_type, price)
-            send_unified_scanner_summary_if_due()
-
-        elif alert_type == "EARLY_LEADER":
-            update_early_leader(symbol, price)
-            enqueue_email(
-                f"EARLY LEADER - {symbol}",
-                f"EARLY LEADER\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n\n"
-                f"This stock is showing early leadership characteristics.\n"
-                f"Watch for ELITE_EARLY or ENTRY_LONG."
-            )
-            send_unified_scanner_summary_if_due()
-
-        # =========================
-        # ENTRY FILTER
-        # =========================
-        elif alert_type == "ENTRY_READY":
-            if in_unified_top(symbol):
-                enqueue_email(
-                    f"ENTRY READY - {symbol}",
-                    f"ENTRY READY\n\n"
-                    f"Symbol: {symbol}\n"
-                    f"Price: {price}\n"
-                    f"Alert Time (NY): {alert_time_ny}\n"
-                    f"Received Time (NY): {ny_now_str()}\n\n"
-                    f"This symbol is currently in the unified scanner Top {TOP_N}."
-                )
-            else:
-                print("FILTERED ENTRY_READY:", symbol)
-
-        elif alert_type == "ENTRY_LONG":
-            if in_unified_top(symbol):
-                enqueue_email(
-                    f"ENTRY LONG - {symbol}",
-                    f"ENTRY LONG\n\n"
-                    f"Symbol: {symbol}\n"
-                    f"Price: {price}\n"
-                    f"Alert Time (NY): {alert_time_ny}\n"
-                    f"Received Time (NY): {ny_now_str()}\n\n"
-                    f"This symbol is currently in the unified scanner Top {TOP_N}."
-                )
-            else:
-                print("FILTERED ENTRY_LONG:", symbol)
-
-        elif alert_type == "ELITE_EARLY":
-            if in_unified_top(symbol):
-                enqueue_email(
-                    f"ELITE EARLY - {symbol}",
-                    f"ELITE EARLY\n\n"
-                    f"Symbol: {symbol}\n"
-                    f"Price: {price}\n"
-                    f"Alert Time (NY): {alert_time_ny}\n"
-                    f"Received Time (NY): {ny_now_str()}\n\n"
-                    f"This symbol is currently in the unified scanner Top {TOP_N}."
-                )
-            else:
-                print("FILTERED ELITE_EARLY:", symbol)
-
-        # =========================
-        # MANAGEMENT ALERTS
-        # =========================
-        elif alert_type == "HOLD_OK":
-            enqueue_email(
-                f"HOLD - {symbol}",
-                f"HOLD\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "TARGET_CHECKPOINT_HIT":
-            enqueue_email(
-                f"TARGET CHECKPOINT - {symbol}",
-                f"TARGET CHECKPOINT HIT\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "SELL_INITIAL_STOP":
-            enqueue_email(
-                f"SELL INITIAL STOP - {symbol}",
-                f"SELL INITIAL STOP\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "SELL_TRAILING_STOP":
-            enqueue_email(
-                f"SELL TRAILING STOP - {symbol}",
-                f"SELL TRAILING STOP\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "SELL_TREND_WEAKENING":
-            enqueue_email(
-                f"SELL TREND WEAKENING - {symbol}",
-                f"SELL TREND WEAKENING\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "SELL_END_OF_DAY":
-            enqueue_email(
-                f"SELL EOD - {symbol}",
-                f"SELL END OF DAY\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "HOLD_OVERNIGHT":
-            enqueue_email(
-                f"HOLD OVERNIGHT - {symbol}",
-                f"HOLD OVERNIGHT\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "HOLD_OVER_WEEKEND":
-            enqueue_email(
-                f"HOLD OVER WEEKEND - {symbol}",
-                f"HOLD OVER WEEKEND\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "SELL_BEFORE_WEEKEND":
-            enqueue_email(
-                f"SELL BEFORE WEEKEND - {symbol}",
-                f"SELL BEFORE WEEKEND\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n"
-            )
-
-        elif alert_type == "LATE_DAY_RISK_OFF":
-            enqueue_email(
-                f"LATE-DAY RISK OFF - {symbol}",
-                f"LATE-DAY RISK OFF\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n\n"
-                f"Late-day weakness is developing.\n"
-                f"Review whether to reduce exposure or exit before the close."
-            )
-
-        # =========================
-        # FALLBACK
-        # =========================
-        else:
-            enqueue_email(
-                f"{alert_type} - {symbol}",
-                f"GENERAL ALERT\n\n"
-                f"Symbol: {symbol}\n"
-                f"Price: {price}\n"
-                f"Alert Time (NY): {alert_time_ny}\n"
-                f"Received Time (NY): {ny_now_str()}\n\n"
-                f"Raw Payload:\n{json.dumps(data, indent=2)}"
-            )
+        log_event(event)
+        route_event(event)
 
         return {"ok": True}
-
     except Exception as e:
-        print("ERROR:", e)
+        print("[ERROR]", e)
         return {"error": str(e)}, 500
-
 
 if __name__ == "__main__":
     validate_env()
