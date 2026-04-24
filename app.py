@@ -36,6 +36,8 @@ cached_top_symbols = []
 cached_top_symbol_set = set()
 
 email_queue = queue.Queue()
+event_queue = queue.Queue()
+
 csv_ready = False
 csv_lock = threading.Lock()
 
@@ -65,13 +67,13 @@ def convert_alert_time_to_ny(time_text):
     try:
         text = str(time_text).strip()
 
-        # Pine `time` is usually Unix milliseconds.
         if text.isdigit():
             dt = datetime.fromtimestamp(int(text) / 1000, tz=timezone.utc)
             return dt.astimezone(NY_TZ).strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
         cleaned = text.replace("Z", "+00:00")
         dt = datetime.fromisoformat(cleaned)
+
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
 
@@ -115,17 +117,18 @@ def ensure_csv():
 def log_event(event):
     ensure_csv()
 
-    with open(CSV_LOG, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            ny_now_str(),
-            utc_now_iso(),
-            event["symbol"],
-            event["type"],
-            event["price"],
-            event["alert_time_ny"],
-            json.dumps(event["raw"], separators=(",", ":"))
-        ])
+    with csv_lock:
+        with open(CSV_LOG, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                ny_now_str(),
+                utc_now_iso(),
+                event["symbol"],
+                event["type"],
+                event["price"],
+                event["alert_time_ny"],
+                json.dumps(event["raw"], separators=(",", ":"))
+            ])
 
 
 def send_email(subject, body):
@@ -155,9 +158,6 @@ def email_worker():
 
         finally:
             email_queue.task_done()
-
-
-threading.Thread(target=email_worker, daemon=True).start()
 
 
 def enqueue_email(subject, body):
@@ -394,30 +394,57 @@ def email_for_event(event):
     if t in ("PREMARKET_TOP", "PREMARKET_ELITE"):
         return (
             f"{t.replace('_', ' ')} - {s}",
-            f"{t}\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n\nThis stock is ranking highly in the premarket scan."
+            f"{t}\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"This stock is ranking highly in the premarket scan."
         )
 
     if t == "EARLY_LEADER":
         return (
             f"EARLY LEADER - {s}",
-            f"EARLY LEADER\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n\nThis stock is showing early leadership characteristics.\nWatch for ELITE_EARLY or ENTRY_LONG."
+            f"EARLY LEADER\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"This stock is showing early leadership characteristics.\n"
+            f"Watch for ELITE_EARLY or ENTRY_LONG."
         )
 
     if t in ("ENTRY_READY", "ENTRY_LONG", "ELITE_EARLY"):
         return (
             f"{t.replace('_', ' ')} - {s}",
-            f"{t}\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n\nThis symbol is currently in the unified scanner Top {TOP_N}."
+            f"{t}\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"This symbol is currently in the unified scanner Top {TOP_N}."
         )
 
     if t == "LATE_DAY_RISK_OFF":
         return (
             f"LATE-DAY RISK OFF - {s}",
-            f"LATE-DAY RISK OFF\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n\nLate-day weakness is developing.\nReview whether to reduce exposure or exit before the close."
+            f"LATE-DAY RISK OFF\n\n"
+            f"Symbol: {s}\n"
+            f"Price: {p}\n"
+            f"Alert Time (NY): {at}\n"
+            f"Received Time (NY): {rt}\n\n"
+            f"Late-day weakness is developing.\n"
+            f"Review whether to reduce exposure or exit before the close."
         )
 
     return (
         f"{t.replace('_', ' ')} - {s}",
-        f"{t}\n\nSymbol: {s}\nPrice: {p}\nAlert Time (NY): {at}\nReceived Time (NY): {rt}\n\nRaw Payload:\n{json.dumps(event['raw'], indent=2)}"
+        f"{t}\n\n"
+        f"Symbol: {s}\n"
+        f"Price: {p}\n"
+        f"Alert Time (NY): {at}\n"
+        f"Received Time (NY): {rt}\n\n"
+        f"Raw Payload:\n{json.dumps(event['raw'], indent=2)}"
     )
 
 
@@ -486,6 +513,27 @@ def route_event(event):
         enqueue_email(subject, body)
 
 
+def event_worker():
+    while True:
+        event = event_queue.get()
+
+        try:
+            print(f"[PROCESS] {event['symbol']} {event['type']} {event['price']}")
+            log_event(event)
+            route_event(event)
+
+        except Exception as e:
+            print("[EVENT WORKER ERROR]", repr(e))
+            print("[EVENT RAW]", json.dumps(event.get("raw", {}), indent=2))
+
+        finally:
+            event_queue.task_done()
+
+
+threading.Thread(target=email_worker, daemon=True).start()
+threading.Thread(target=event_worker, daemon=True).start()
+
+
 @app.route("/")
 def home():
     return "running"
@@ -497,6 +545,8 @@ def health():
         "time_ny": ny_now_str(),
         "top_symbols": get_top_symbols(),
         "tracked": len(get_ranked()),
+        "event_queue_size": event_queue.qsize(),
+        "email_queue_size": email_queue.qsize(),
     }
 
 
@@ -520,21 +570,21 @@ def webhook():
             data = json.loads(raw_body)
 
         if not isinstance(data, dict):
-            return {"error": "invalid json"}, 400
+            print("[BAD PAYLOAD]", data)
+            return {"ok": False, "error": "invalid json"}, 200
 
         event = normalize_event(data)
 
-        print(f"[RECV] {event['symbol']} {event['type']} {event['price']}")
+        print(f"[RECV QUEUED] {event['symbol']} {event['type']} {event['price']}")
 
-        log_event(event)
-        route_event(event)
+        event_queue.put(event)
 
-        return {"ok": True}
+        return {"ok": True}, 200
 
     except Exception as e:
-        print("[WEBHOOK ERROR]", repr(e))
+        print("[WEBHOOK PARSE ERROR]", repr(e))
         print("[REQUEST DATA]", request.data.decode("utf-8", errors="ignore"))
-        return {"error": str(e)}, 500
+        return {"ok": False, "error": str(e)}, 200
 
 
 if __name__ == "__main__":
