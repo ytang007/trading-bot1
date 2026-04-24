@@ -26,7 +26,7 @@ ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "true").lower() == "true"
 CSV_LOG = os.getenv("CSV_LOG", "alerts_log.csv")
 
 ROLLING_WINDOW_MINUTES = 30
-SUMMARY_INTERVAL_SECONDS = 1800   # 30 minutes
+SUMMARY_INTERVAL_SECONDS = 900   # 15 minutes
 TOP_N = 5
 
 NY_TZ = ZoneInfo("America/New_York")
