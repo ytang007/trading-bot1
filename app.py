@@ -552,11 +552,21 @@ def health():
 
 @app.route("/test-email")
 def test_email():
-    enqueue_email(
-        "Trading Bot Test",
-        f"This is a test email.\nGenerated: {ny_now_str()}"
-    )
-    return {"ok": True, "message": "test email queued"}
+    try:
+        subject = "Trading Bot Test"
+        body = f"This is a direct test email.\nGenerated: {ny_now_str()}"
+
+        if ENABLE_EMAIL:
+            send_email(subject, body)
+            print("[TEST EMAIL SENT DIRECTLY]")
+            return {"ok": True, "message": "test email sent directly"}
+        else:
+            print("[TEST EMAIL DISABLED]")
+            return {"ok": False, "message": "ENABLE_EMAIL is false"}
+
+    except Exception as e:
+        print("[TEST EMAIL ERROR]", repr(e))
+        return {"ok": False, "error": str(e)}, 500
 
 
 @app.route("/webhook", methods=["POST"])
