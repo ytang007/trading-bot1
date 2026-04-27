@@ -584,8 +584,12 @@ def webhook():
             return {"ok": False, "error": "invalid json"}, 200
 
         event = normalize_event(data)
+        print(f"[RECV QUEUED] {event['symbol']} {event['type']} {event['price']}", flush=True)
 
-        print(f"[RECV QUEUED] {event['symbol']} {event['type']} {event['price']}")
+        enqueue_email(
+            f"DEBUG WEBHOOK - {event['type']} - {event['symbol']}",
+            f"Webhook received:\n\n{json.dumps(data, indent=2)}"
+        )
 
         event_queue.put(event)
 
