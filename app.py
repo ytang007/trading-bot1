@@ -571,33 +571,21 @@ def test_email():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    print("[WEBHOOK HIT - VERSION 2026-04-27 DEBUG]", flush=True)
+
     try:
-        data = request.get_json(silent=True)
+        raw_body = request.data.decode("utf-8", errors="ignore")
+        print("[RAW BODY]", raw_body, flush=True)
 
-        if data is None:
-            raw_body = request.data.decode("utf-8", errors="ignore").strip()
-            print("[RAW BODY]", raw_body)
-            data = json.loads(raw_body)
-
-        if not isinstance(data, dict):
-            print("[BAD PAYLOAD]", data)
-            return {"ok": False, "error": "invalid json"}, 200
-
-        event = normalize_event(data)
-        print(f"[RECV QUEUED] {event['symbol']} {event['type']} {event['price']}", flush=True)
-
-        enqueue_email(
-            f"DEBUG WEBHOOK - {event['type']} - {event['symbol']}",
-            f"Webhook received:\n\n{json.dumps(data, indent=2)}"
+        send_email(
+            "DEBUG WEBHOOK DIRECT",
+            f"Webhook hit directly.\n\nRaw body:\n{raw_body}"
         )
 
-        event_queue.put(event)
-
-        return {"ok": True}, 200
+        return {"ok": True, "debug": "webhook direct email sent"}, 200
 
     except Exception as e:
-        print("[WEBHOOK PARSE ERROR]", repr(e))
-        print("[REQUEST DATA]", request.data.decode("utf-8", errors="ignore"))
+        print("[WEBHOOK DEBUG ERROR]", repr(e), flush=True)
         return {"ok": False, "error": str(e)}, 200
 
 
