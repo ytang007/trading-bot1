@@ -51,6 +51,10 @@ csv_lock = threading.Lock()
 def utc_now():
     return datetime.now(timezone.utc)
 
+def is_market_email_window():
+    now = ny_now()
+    minutes = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= minutes <= 16 * 60
 
 def ny_now():
     return datetime.now(NY_TZ)
@@ -586,9 +590,13 @@ def handle_management_event(event):
     enqueue_email(subject, body)
 
 
-def handle_swing_event(event):
+ddef handle_swing_event(event):
     update_swing_state(event)
-    send_swing_summary_if_due(force=False)
+
+    if is_market_email_window():
+        send_swing_summary_if_due(force=False)
+    else:
+        print(f"[SWING EMAIL HELD OUTSIDE MARKET HOURS] {event['symbol']} {event['type']}", flush=True)
 
 
 def route_event(event):
