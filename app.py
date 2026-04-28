@@ -590,7 +590,7 @@ def handle_management_event(event):
     enqueue_email(subject, body)
 
 
-ddef handle_swing_event(event):
+def handle_swing_event(event):
     update_swing_state(event)
 
     if is_market_email_window():
