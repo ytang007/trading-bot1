@@ -63,6 +63,11 @@ def ny_now_str():
 def utc_now_iso():
     return utc_now().isoformat()
 
+def safe_float(value, default=0.0):
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return default
 
 def convert_alert_time_to_ny(time_text):
     if not time_text:
@@ -415,7 +420,11 @@ def swing_status(alert_type):
 
 def update_swing_state(event):
     symbol = event["symbol"]
-    score = swing_signal_score(event["type"])
+    pine_score = safe_float(event["raw"].get("score", 0))
+    signal_score = swing_signal_score(event["type"])
+
+    # Combined score: Pine quality first, then signal strength
+    combined_score = pine_score * 10 + signal_score
 
     with swing_lock:
         old = swing_state.get(symbol, {})
@@ -424,7 +433,9 @@ def update_swing_state(event):
             "symbol": symbol,
             "last_signal": event["type"],
             "status": swing_status(event["type"]),
-            "score": score,
+            "pine_score": pine_score,
+            "signal_score": signal_score,
+            "score": combined_score,
             "price": event["price"],
             "alert_time_ny": event["alert_time_ny"],
             "received_time_ny": event["received_time_ny"],
@@ -473,17 +484,20 @@ def send_swing_summary_if_due(force=False):
 
     for i, rec in enumerate(ranked[:10], 1):
         lines.append(
-            f"{i}. {rec['symbol']} | {rec['status']} | Score: {rec['score']} | "
-            f"Price: {rec['price']} | Count: {rec['count']} | Last: {rec['received_time_ny']}"
+            f"{i}. {rec['symbol']} | {rec['status']} | "
+            f"Total Score: {rec['score']:.1f} | "
+            f"Pine Score: {rec.get('pine_score', 0):.1f} | "
+            f"Signal Score: {rec.get('signal_score', 0)} | "
+            f"Price: {rec['price']} | Count: {rec['count']} | "
+            f"Last: {rec['received_time_ny']}"
         )
 
     lines.extend([
         "",
         "Score meaning:",
-        "90 = breakout strength",
-        "85 = pullback/bounce buy zone",
-        "45 = warning / tighten risk",
-        "10 = exit condition",
+        "Pine Score = Daily+Weekly swing quality from TradingView V3",
+        "Signal Score: 90 breakout, 85 buy zone, 45 warning, 10 exit",
+        "Total Score = Pine Score × 10 + Signal Score",
         "",
         "Use this as swing watchlist ranking, not automatic buy/sell.",
     ])
