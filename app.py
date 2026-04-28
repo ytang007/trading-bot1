@@ -23,13 +23,19 @@ ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "true").lower() == "true"
 CSV_LOG = os.getenv("CSV_LOG", "alerts_log.csv")
 
 ROLLING_WINDOW_MINUTES = 30
-SUMMARY_INTERVAL_SECONDS = 900
-TOP_N = 5
+SCANNER_SUMMARY_INTERVAL_SECONDS = int(os.getenv("SCANNER_SUMMARY_INTERVAL_SECONDS", "60"))
+SWING_SUMMARY_INTERVAL_SECONDS = int(os.getenv("SWING_SUMMARY_INTERVAL_SECONDS", "600"))
+TOP_N = 10
 
 NY_TZ = ZoneInfo("America/New_York")
 
 scanner_state = {}
 scanner_lock = threading.Lock()
+last_scanner_summary_sent = 0
+
+swing_state = {}
+swing_lock = threading.Lock()
+last_swing_summary_sent = 0
 
 cached_ranked = []
 cached_top_symbols = []
@@ -40,8 +46,6 @@ event_queue = queue.Queue()
 
 csv_ready = False
 csv_lock = threading.Lock()
-
-last_summary_sent = 0
 
 
 def utc_now():
@@ -108,7 +112,7 @@ def ensure_csv():
                     "type",
                     "price",
                     "alert_time_ny",
-                    "raw_json"
+                    "raw_json",
                 ])
 
         csv_ready = True
@@ -127,7 +131,7 @@ def log_event(event):
                 event["type"],
                 event["price"],
                 event["alert_time_ny"],
-                json.dumps(event["raw"], separators=(",", ":"))
+                json.dumps(event["raw"], separators=(",", ":")),
             ])
 
 
@@ -142,6 +146,10 @@ def send_email(subject, body):
         server.send_message(msg)
 
 
+def enqueue_email(subject, body):
+    email_queue.put({"subject": subject, "body": body})
+
+
 def email_worker():
     while True:
         job = email_queue.get()
@@ -149,26 +157,36 @@ def email_worker():
         try:
             if ENABLE_EMAIL:
                 send_email(job["subject"], job["body"])
-                print("[EMAIL SENT]", job["subject"])
+                print("[EMAIL SENT]", job["subject"], flush=True)
             else:
-                print("[EMAIL DISABLED]", job["subject"])
+                print("[EMAIL DISABLED]", job["subject"], flush=True)
 
         except Exception as e:
-            print("[EMAIL ERROR]", repr(e))
+            print("[EMAIL ERROR]", repr(e), flush=True)
 
         finally:
             email_queue.task_done()
 
 
-def enqueue_email(subject, body):
-    email_queue.put({"subject": subject, "body": body})
-
-
 def normalize_event(data):
-    symbol = str(data.get("symbol", "UNK"))
-    alert_type = str(data.get("type", "UNK"))
+    symbol = str(data.get("symbol", "UNK")).upper().strip()
+    alert_type = str(data.get("type", "UNK")).upper().strip()
     price = str(data.get("price", "0"))
     alert_time_raw = str(data.get("time", "UNKNOWN"))
+
+    if alert_type == "SWING_MASTER":
+        code = str(data.get("signal_code", "0")).strip()
+
+        if code in ("1", "1.0"):
+            alert_type = "SWING_BUY"
+        elif code in ("2", "2.0"):
+            alert_type = "SWING_BREAKOUT"
+        elif code in ("3", "3.0"):
+            alert_type = "SWING_WARNING"
+        elif code in ("4", "4.0"):
+            alert_type = "SWING_EXIT"
+        else:
+            alert_type = "SWING_UNKNOWN"
 
     return {
         "symbol": symbol,
@@ -181,7 +199,11 @@ def normalize_event(data):
     }
 
 
-def _new_state_record(price, now):
+# =========================
+# SCANNER STATE + RANKING
+# =========================
+
+def _new_scanner_record(price, now):
     return {
         "hits": deque(),
         "activity_score": 0,
@@ -194,16 +216,22 @@ def _new_state_record(price, now):
     }
 
 
+def scanner_score(rec):
+    return (
+        rec.get("premarket_score", 0) * 30
+        + rec.get("quality_score", 0) * 25
+        + rec.get("early_leader_score", 0) * 20
+        + rec.get("activity_score", 0) * 5
+    )
+
+
 def refresh_rankings():
     global cached_ranked, cached_top_symbols, cached_top_symbol_set
 
     cached_ranked = sorted(
         scanner_state.items(),
         key=lambda x: (
-            x[1]["premarket_score"],
-            x[1]["quality_score"],
-            x[1]["early_leader_score"],
-            x[1]["activity_score"],
+            scanner_score(x[1]),
             x[1]["last"],
         ),
         reverse=True,
@@ -273,7 +301,7 @@ def update_scanner_state(event):
         prune_scanner_state(now)
 
         if symbol not in scanner_state:
-            scanner_state[symbol] = _new_state_record(price, now)
+            scanner_state[symbol] = _new_scanner_record(price, now)
 
         rec = scanner_state[symbol]
         rec["price"] = price
@@ -304,12 +332,12 @@ def update_scanner_state(event):
         refresh_rankings()
 
 
-def send_scanner_summary_if_due():
-    global last_summary_sent
+def send_scanner_summary_if_due(force=False):
+    global last_scanner_summary_sent
 
     now = time.time()
 
-    if now - last_summary_sent < SUMMARY_INTERVAL_SECONDS:
+    if not force and now - last_scanner_summary_sent < SCANNER_SUMMARY_INTERVAL_SECONDS:
         return
 
     ranked = get_ranked()
@@ -317,72 +345,156 @@ def send_scanner_summary_if_due():
     if not ranked:
         return
 
-    premarket_elite = [(s, d) for s, d in ranked if d["premarket_score"] == 2][:TOP_N]
-    premarket_top = [(s, d) for s, d in ranked if d["premarket_score"] == 1][:TOP_N]
-    elite = [(s, d) for s, d in ranked if d["quality_score"] == 2][:TOP_N]
-    top_only = [(s, d) for s, d in ranked if d["quality_score"] == 1][:TOP_N]
-
     lines = [
-        "Unified Scanner Summary",
+        "Scanner Ranked Summary",
         f"Generated: {ny_now_str()}",
         "",
-        "Premarket Elite"
+        "Top Ranked Stocks",
     ]
 
-    if premarket_elite:
-        for i, (s, d) in enumerate(premarket_elite, 1):
-            early = " | Early Leader" if d["early_leader_score"] == 1 else ""
-            lines.append(f"{i}. {s} | Price: {d['price']}{early}")
-    else:
-        lines.append("None")
+    for i, (symbol, rec) in enumerate(ranked[:TOP_N], 1):
+        tags = []
 
-    lines.extend(["", "Premarket Top"])
+        if rec.get("premarket_tier"):
+            tags.append(rec["premarket_tier"])
 
-    if premarket_top:
-        for i, (s, d) in enumerate(premarket_top, 1):
-            early = " | Early Leader" if d["early_leader_score"] == 1 else ""
-            lines.append(f"{i}. {s} | Price: {d['price']}{early}")
-    else:
-        lines.append("None")
+        if rec.get("quality_score", 0) == 2:
+            tags.append("ELITE")
+        elif rec.get("quality_score", 0) == 1:
+            tags.append("TOP")
 
-    lines.extend(["", "Elite Picks"])
+        if rec.get("early_leader_score", 0) == 1:
+            tags.append("EARLY_LEADER")
 
-    if elite:
-        for i, (s, d) in enumerate(elite, 1):
-            pm = f" | {d['premarket_tier']}" if d["premarket_tier"] else ""
-            early = " | Early Leader" if d["early_leader_score"] == 1 else ""
-            lines.append(
-                f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{pm}{early}"
-            )
-    else:
-        lines.append("None")
+        tag_text = ", ".join(tags) if tags else "TRACKED"
 
-    lines.extend(["", "Top Stocks"])
-
-    if top_only:
-        for i, (s, d) in enumerate(top_only, 1):
-            pm = f" | {d['premarket_tier']}" if d["premarket_tier"] else ""
-            early = " | Early Leader" if d["early_leader_score"] == 1 else ""
-            lines.append(
-                f"{i}. {s} | Activity Score: {d['activity_score']} | Price: {d['price']}{pm}{early}"
-            )
-    else:
-        lines.append("None")
+        lines.append(
+            f"{i}. {symbol} | Score: {scanner_score(rec)} | {tag_text} | "
+            f"Activity: {rec['activity_score']} | Price: {rec['price']}"
+        )
 
     lines.extend([
         "",
-        "How to use this:",
-        "- Premarket Elite = strongest names before 9:30",
-        "- Premarket Top = secondary premarket watchlist",
-        "- Early Leader = pressure building after the open",
-        "- Elite Picks = strongest confirmed intraday names",
-        "- Wait for ENTRY_LONG to execute",
-        "- ELITE_EARLY = starter position only",
+        "Score model:",
+        "Premarket Elite/Top + Scanner Elite/Top + Early Leader + Activity",
+        "",
+        "Use this as ranking/watchlist guidance, not automatic buy.",
     ])
 
-    enqueue_email("Unified Scanner Summary", "\n".join(lines))
-    last_summary_sent = now
+    enqueue_email("Scanner Ranked Summary", "\n".join(lines))
+    last_scanner_summary_sent = now
 
+
+# =========================
+# SWING STATE + RANKING
+# =========================
+
+def swing_signal_score(alert_type):
+    if alert_type == "SWING_BREAKOUT":
+        return 90
+    if alert_type == "SWING_BUY":
+        return 85
+    if alert_type == "SWING_WARNING":
+        return 45
+    if alert_type == "SWING_EXIT":
+        return 10
+    return 0
+
+
+def swing_status(alert_type):
+    if alert_type == "SWING_BREAKOUT":
+        return "BREAKOUT"
+    if alert_type == "SWING_BUY":
+        return "BUY ZONE"
+    if alert_type == "SWING_WARNING":
+        return "WARNING"
+    if alert_type == "SWING_EXIT":
+        return "EXIT"
+    return "UNKNOWN"
+
+
+def update_swing_state(event):
+    symbol = event["symbol"]
+    score = swing_signal_score(event["type"])
+
+    with swing_lock:
+        old = swing_state.get(symbol, {})
+
+        swing_state[symbol] = {
+            "symbol": symbol,
+            "last_signal": event["type"],
+            "status": swing_status(event["type"]),
+            "score": score,
+            "price": event["price"],
+            "alert_time_ny": event["alert_time_ny"],
+            "received_time_ny": event["received_time_ny"],
+            "count": int(old.get("count", 0)) + 1,
+            "raw": event["raw"],
+        }
+
+
+def get_swing_state_snapshot():
+    with swing_lock:
+        return dict(swing_state)
+
+
+def get_ranked_swing():
+    with swing_lock:
+        return sorted(
+            swing_state.values(),
+            key=lambda x: (
+                x.get("score", 0),
+                x.get("count", 0),
+                x.get("received_time_ny", ""),
+            ),
+            reverse=True,
+        )
+
+
+def send_swing_summary_if_due(force=False):
+    global last_swing_summary_sent
+
+    now = time.time()
+
+    if not force and now - last_swing_summary_sent < SWING_SUMMARY_INTERVAL_SECONDS:
+        return
+
+    ranked = get_ranked_swing()
+
+    if not ranked:
+        return
+
+    lines = [
+        "Swing Trading Summary",
+        f"Generated: {ny_now_str()}",
+        "",
+        "Top Swing Candidates / Alerts",
+    ]
+
+    for i, rec in enumerate(ranked[:10], 1):
+        lines.append(
+            f"{i}. {rec['symbol']} | {rec['status']} | Score: {rec['score']} | "
+            f"Price: {rec['price']} | Count: {rec['count']} | Last: {rec['received_time_ny']}"
+        )
+
+    lines.extend([
+        "",
+        "Score meaning:",
+        "90 = breakout strength",
+        "85 = pullback/bounce buy zone",
+        "45 = warning / tighten risk",
+        "10 = exit condition",
+        "",
+        "Use this as swing watchlist ranking, not automatic buy/sell.",
+    ])
+
+    enqueue_email("Swing Trading Summary", "\n".join(lines))
+    last_swing_summary_sent = now
+
+
+# =========================
+# EMAIL TEMPLATES
+# =========================
 
 def email_for_event(event):
     t = event["type"]
@@ -391,62 +503,20 @@ def email_for_event(event):
     at = event["alert_time_ny"]
     rt = event["received_time_ny"]
 
-    if t in ("PREMARKET_TOP", "PREMARKET_ELITE"):
-        return (
-            f"{t.replace('_', ' ')} - {s}",
-            f"{t}\n\n"
-            f"Symbol: {s}\n"
-            f"Price: {p}\n"
-            f"Alert Time (NY): {at}\n"
-            f"Received Time (NY): {rt}\n\n"
-            f"This stock is ranking highly in the premarket scan."
-        )
-
-    if t == "EARLY_LEADER":
-        return (
-            f"EARLY LEADER - {s}",
-            f"EARLY LEADER\n\n"
-            f"Symbol: {s}\n"
-            f"Price: {p}\n"
-            f"Alert Time (NY): {at}\n"
-            f"Received Time (NY): {rt}\n\n"
-            f"This stock is showing early leadership characteristics.\n"
-            f"Watch for ELITE_EARLY or ENTRY_LONG."
-        )
-
-    if t in ("ENTRY_READY", "ENTRY_LONG", "ELITE_EARLY"):
-        return (
-            f"{t.replace('_', ' ')} - {s}",
-            f"{t}\n\n"
-            f"Symbol: {s}\n"
-            f"Price: {p}\n"
-            f"Alert Time (NY): {at}\n"
-            f"Received Time (NY): {rt}\n\n"
-            f"This symbol is currently in the unified scanner Top {TOP_N}."
-        )
-
-    if t == "LATE_DAY_RISK_OFF":
-        return (
-            f"LATE-DAY RISK OFF - {s}",
-            f"LATE-DAY RISK OFF\n\n"
-            f"Symbol: {s}\n"
-            f"Price: {p}\n"
-            f"Alert Time (NY): {at}\n"
-            f"Received Time (NY): {rt}\n\n"
-            f"Late-day weakness is developing.\n"
-            f"Review whether to reduce exposure or exit before the close."
-        )
-
     return (
         f"{t.replace('_', ' ')} - {s}",
         f"{t}\n\n"
         f"Symbol: {s}\n"
         f"Price: {p}\n"
-        f"Alert Time (NY): {at}\n"
-        f"Received Time (NY): {rt}\n\n"
-        f"Raw Payload:\n{json.dumps(event['raw'], indent=2)}"
+        f"Alert Time: {at}\n"
+        f"Received: {rt}\n\n"
+        f"Raw:\n{json.dumps(event['raw'], indent=2)}"
     )
 
+
+# =========================
+# ROUTING
+# =========================
 
 SCANNER_TYPES = {
     "PREMARKET_TOP",
@@ -475,15 +545,18 @@ MANAGEMENT_TYPES = {
     "LATE_DAY_RISK_OFF",
 }
 
+SWING_TYPES = {
+    "SWING_BUY",
+    "SWING_BREAKOUT",
+    "SWING_WARNING",
+    "SWING_EXIT",
+    "SWING_UNKNOWN",
+}
+
 
 def handle_scanner_event(event):
     update_scanner_state(event)
-
-    if event["type"] in {"PREMARKET_TOP", "PREMARKET_ELITE", "EARLY_LEADER"}:
-        subject, body = email_for_event(event)
-        enqueue_email(subject, body)
-
-    send_scanner_summary_if_due()
+    send_scanner_summary_if_due(force=False)
 
 
 def handle_entry_event(event):
@@ -491,12 +564,17 @@ def handle_entry_event(event):
         subject, body = email_for_event(event)
         enqueue_email(subject, body)
     else:
-        print(f"[FILTERED {event['type']}] {event['symbol']} not in Top {TOP_N}")
+        print(f"[FILTERED {event['type']}] {event['symbol']} not in Top {TOP_N}", flush=True)
 
 
 def handle_management_event(event):
     subject, body = email_for_event(event)
     enqueue_email(subject, body)
+
+
+def handle_swing_event(event):
+    update_swing_state(event)
+    send_swing_summary_if_due(force=False)
 
 
 def route_event(event):
@@ -508,6 +586,8 @@ def route_event(event):
         handle_entry_event(event)
     elif t in MANAGEMENT_TYPES:
         handle_management_event(event)
+    elif t in SWING_TYPES:
+        handle_swing_event(event)
     else:
         subject, body = email_for_event(event)
         enqueue_email(subject, body)
@@ -518,13 +598,13 @@ def event_worker():
         event = event_queue.get()
 
         try:
-            print(f"[PROCESS] {event['symbol']} {event['type']} {event['price']}")
+            print(f"[PROCESS] {event['symbol']} {event['type']} {event['price']}", flush=True)
             log_event(event)
             route_event(event)
 
         except Exception as e:
-            print("[EVENT WORKER ERROR]", repr(e))
-            print("[EVENT RAW]", json.dumps(event.get("raw", {}), indent=2))
+            print("[EVENT WORKER ERROR]", repr(e), flush=True)
+            print("[EVENT RAW]", json.dumps(event.get("raw", {}), indent=2), flush=True)
 
         finally:
             event_queue.task_done()
@@ -533,6 +613,10 @@ def event_worker():
 threading.Thread(target=email_worker, daemon=True).start()
 threading.Thread(target=event_worker, daemon=True).start()
 
+
+# =========================
+# ROUTES
+# =========================
 
 @app.route("/")
 def home():
@@ -544,10 +628,35 @@ def health():
     return {
         "time_ny": ny_now_str(),
         "top_symbols": get_top_symbols(),
-        "tracked": len(get_ranked()),
+        "tracked_scanner": len(get_ranked()),
+        "tracked_swing": len(get_swing_state_snapshot()),
         "event_queue_size": event_queue.qsize(),
         "email_queue_size": email_queue.qsize(),
+        "scanner_summary_interval_seconds": SCANNER_SUMMARY_INTERVAL_SECONDS,
+        "swing_summary_interval_seconds": SWING_SUMMARY_INTERVAL_SECONDS,
     }
+
+
+@app.route("/scanner-state")
+def scanner_state_route():
+    return {symbol: rec for symbol, rec in get_ranked()}
+
+
+@app.route("/scanner-summary")
+def scanner_summary_route():
+    send_scanner_summary_if_due(force=True)
+    return {"ok": True, "message": "scanner summary queued"}
+
+
+@app.route("/swing-state")
+def swing_state_route():
+    return get_swing_state_snapshot()
+
+
+@app.route("/swing-summary")
+def swing_summary_route():
+    send_swing_summary_if_due(force=True)
+    return {"ok": True, "message": "swing summary queued"}
 
 
 @app.route("/test-email")
@@ -558,14 +667,11 @@ def test_email():
 
         if ENABLE_EMAIL:
             send_email(subject, body)
-            print("[TEST EMAIL SENT DIRECTLY]")
             return {"ok": True, "message": "test email sent directly"}
         else:
-            print("[TEST EMAIL DISABLED]")
             return {"ok": False, "message": "ENABLE_EMAIL is false"}
 
     except Exception as e:
-        print("[TEST EMAIL ERROR]", repr(e))
         return {"ok": False, "error": str(e)}, 500
 
 
@@ -581,18 +687,12 @@ def webhook():
             data = json.loads(raw_body)
 
         if not isinstance(data, dict):
-            send_email("WEBHOOK BAD PAYLOAD", raw_body)
+            print("[BAD PAYLOAD]", raw_body, flush=True)
             return {"ok": False, "error": "invalid json"}, 200
 
         event = normalize_event(data)
 
-        print(f"[RECV] {event['symbol']} {event['type']} {event['price']}", flush=True)
-
-        # Temporary direct debug email
-        send_email(
-            f"DEBUG PARSED - {event['type']} - {event['symbol']}",
-            f"Parsed event:\n\n{json.dumps(event, indent=2)}"
-        )
+        print(f"[RECV QUEUED] {event['symbol']} {event['type']} {event['price']}", flush=True)
 
         event_queue.put(event)
 
@@ -602,12 +702,16 @@ def webhook():
         print("[WEBHOOK ERROR]", repr(e), flush=True)
         print("[REQUEST DATA]", request.data.decode("utf-8", errors="ignore"), flush=True)
 
-        send_email(
-            "WEBHOOK ERROR",
-            f"Error:\n{repr(e)}\n\nRaw:\n{request.data.decode('utf-8', errors='ignore')}"
-        )
+        try:
+            send_email(
+                "WEBHOOK ERROR",
+                f"Error:\n{repr(e)}\n\nRaw:\n{request.data.decode('utf-8', errors='ignore')}"
+            )
+        except Exception as email_error:
+            print("[WEBHOOK ERROR EMAIL FAILED]", repr(email_error), flush=True)
 
         return {"ok": False, "error": str(e)}, 200
+
 
 if __name__ == "__main__":
     validate_env()
