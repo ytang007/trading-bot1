@@ -47,9 +47,38 @@ event_queue = queue.Queue()
 csv_ready = False
 csv_lock = threading.Lock()
 
+DAILY_TOP_N = int(os.getenv("DAILY_TOP_N", "3"))
+daily_focus_date = None
+daily_focus_symbols = set()
 
 def utc_now():
     return datetime.now(timezone.utc)
+
+def today_ny_date():
+    return ny_now().strftime("%Y-%m-%d")
+
+
+def reset_daily_focus_if_needed():
+    global daily_focus_date, daily_focus_symbols
+
+    today = today_ny_date()
+
+    if daily_focus_date != today:
+        daily_focus_date = today
+        daily_focus_symbols = set()
+        print("[DAILY FOCUS RESET]", today, flush=True)
+
+def update_daily_top3_from_scanner():
+    global daily_focus_symbols
+
+    reset_daily_focus_if_needed()
+
+    ranked = get_ranked()
+    top3 = [symbol for symbol, rec in ranked[:DAILY_TOP_N]]
+
+    daily_focus_symbols = set(top3)
+
+    return top3
 
 def is_market_email_window():
     now = ny_now()
@@ -361,7 +390,10 @@ def send_scanner_summary_if_due(force=False):
         "Top Ranked Stocks",
     ]
 
-    for i, (symbol, rec) in enumerate(ranked[:TOP_N], 1):
+    top3_symbols = update_daily_top3_from_scanner()
+    top3_ranked = [(s, r) for s, r in ranked if s in top3_symbols]
+
+    for i, (symbol, rec) in enumerate(top3_ranked, 1):
         tags = []
 
         if rec.get("premarket_tier"):
@@ -390,7 +422,7 @@ def send_scanner_summary_if_due(force=False):
         "Use this as ranking/watchlist guidance, not automatic buy.",
     ])
 
-    enqueue_email("Scanner Ranked Summary", "\n".join(lines))
+    enqueue_email("Top 3 Daily Focus Stocks", "\n".join(lines))
     last_scanner_summary_sent = now
 
 
@@ -486,7 +518,7 @@ def send_swing_summary_if_due(force=False):
         "Top Swing Candidates / Alerts",
     ]
 
-    for i, rec in enumerate(ranked[:10], 1):
+    for i, rec in enumerate(ranked[:DAILY_TOP_N], 1):
         lines.append(
             f"{i}. {rec['symbol']} | {rec['status']} | "
             f"Total Score: {rec['score']:.1f} | "
