@@ -9,81 +9,65 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
+
 from flask import Flask, request
 
 app = Flask(__name__)
 
+# =========================
+# CONFIG
+# =========================
 PORT = int(os.getenv("PORT", "10000"))
 
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 TO_EMAIL = os.getenv("TO_EMAIL", EMAIL_ADDRESS)
-
 ENABLE_EMAIL = os.getenv("ENABLE_EMAIL", "true").lower() == "true"
+
 CSV_LOG = os.getenv("CSV_LOG", "alerts_log.csv")
 
-ROLLING_WINDOW_MINUTES = 30
-SCANNER_SUMMARY_INTERVAL_SECONDS = int(os.getenv("SCANNER_SUMMARY_INTERVAL_SECONDS", "1200"))
-SWING_SUMMARY_INTERVAL_SECONDS = int(os.getenv("SWING_SUMMARY_INTERVAL_SECONDS", "1200"))
-TOP_N = 10
+TOP_N = int(os.getenv("TOP_N", "10"))
+DAILY_TOP_N = int(os.getenv("DAILY_TOP_N", "3"))
+
+ROLLING_WINDOW_MINUTES = int(os.getenv("ROLLING_WINDOW_MINUTES", "30"))
+
+SCANNER_SUMMARY_INTERVAL_SECONDS = int(os.getenv("SCANNER_SUMMARY_INTERVAL_SECONDS", "600"))
+SWING_SUMMARY_INTERVAL_SECONDS = int(os.getenv("SWING_SUMMARY_INTERVAL_SECONDS", "900"))
+ENTRY_SUMMARY_INTERVAL_SECONDS = int(os.getenv("ENTRY_SUMMARY_INTERVAL_SECONDS", "600"))
 
 NY_TZ = ZoneInfo("America/New_York")
 
+# =========================
+# STATE
+# =========================
 scanner_state = {}
-scanner_lock = threading.Lock()
-last_scanner_summary_sent = 0
-
 swing_state = {}
-swing_lock = threading.Lock()
-last_swing_summary_sent = 0
+entry_state = {}
 
-cached_ranked = []
-cached_top_symbols = []
-cached_top_symbol_set = set()
+scanner_lock = threading.Lock()
+swing_lock = threading.Lock()
+entry_lock = threading.Lock()
+csv_lock = threading.Lock()
 
 email_queue = queue.Queue()
 event_queue = queue.Queue()
 
 csv_ready = False
-csv_lock = threading.Lock()
 
-DAILY_TOP_N = int(os.getenv("DAILY_TOP_N", "3"))
+last_scanner_summary_sent = 0
+last_swing_summary_sent = 0
+last_entry_summary_sent = 0
+
 daily_focus_date = None
 daily_focus_symbols = set()
 
+
+# =========================
+# TIME / HELPERS
+# =========================
 def utc_now():
     return datetime.now(timezone.utc)
 
-def today_ny_date():
-    return ny_now().strftime("%Y-%m-%d")
-
-
-def reset_daily_focus_if_needed():
-    global daily_focus_date, daily_focus_symbols
-
-    today = today_ny_date()
-
-    if daily_focus_date != today:
-        daily_focus_date = today
-        daily_focus_symbols = set()
-        print("[DAILY FOCUS RESET]", today, flush=True)
-
-def update_daily_top3_from_scanner():
-    global daily_focus_symbols
-
-    reset_daily_focus_if_needed()
-
-    ranked = get_ranked()
-    top3 = [symbol for symbol, rec in ranked[:DAILY_TOP_N]]
-
-    daily_focus_symbols = set(top3)
-
-    return top3
-
-def is_market_email_window():
-    now = ny_now()
-    minutes = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= minutes <= 16 * 60
 
 def ny_now():
     return datetime.now(NY_TZ)
@@ -96,11 +80,17 @@ def ny_now_str():
 def utc_now_iso():
     return utc_now().isoformat()
 
+
+def today_ny_date():
+    return ny_now().strftime("%Y-%m-%d")
+
+
 def safe_float(value, default=0.0):
     try:
         return float(str(value).strip())
     except Exception:
         return default
+
 
 def convert_alert_time_to_ny(time_text):
     if not time_text:
@@ -125,6 +115,26 @@ def convert_alert_time_to_ny(time_text):
         return str(time_text)
 
 
+def market_hours_now():
+    now = ny_now()
+    hhmm = now.hour * 100 + now.minute
+    return 930 <= hhmm <= 1600
+
+
+def reset_daily_focus_if_needed():
+    global daily_focus_date, daily_focus_symbols
+
+    today = today_ny_date()
+
+    if daily_focus_date != today:
+        daily_focus_date = today
+        daily_focus_symbols = set()
+        print("[DAILY FOCUS RESET]", today, flush=True)
+
+
+# =========================
+# EMAIL / CSV
+# =========================
 def validate_env():
     if ENABLE_EMAIL and (not EMAIL_ADDRESS or not EMAIL_PASSWORD):
         raise RuntimeError("Missing EMAIL_ADDRESS or EMAIL_PASSWORD")
@@ -206,15 +216,30 @@ def email_worker():
             email_queue.task_done()
 
 
+# =========================
+# NORMALIZE / DECODE
+# =========================
 def normalize_event(data):
     symbol = str(data.get("symbol", "UNK")).upper().strip()
     alert_type = str(data.get("type", "UNK")).upper().strip()
     price = str(data.get("price", "0"))
     alert_time_raw = str(data.get("time", "UNKNOWN"))
 
-    if alert_type == "SWING_MASTER":
-        code = str(data.get("signal_code", "0")).strip()
+    code = str(data.get("signal_code", "0")).strip()
 
+    # Elite Swing Filter V4
+    if alert_type == "ELITE_SWING_MASTER":
+        if code in ("1", "1.0"):
+            alert_type = "ELITE_SWING"
+        elif code in ("2", "2.0"):
+            alert_type = "SWING_WATCH"
+        elif code in ("3", "3.0"):
+            alert_type = "SWING_AVOID"
+        else:
+            alert_type = "SWING_UNKNOWN"
+
+    # Swing V2/V3
+    elif alert_type == "SWING_MASTER":
         if code in ("1", "1.0"):
             alert_type = "SWING_BUY"
         elif code in ("2", "2.0"):
@@ -225,6 +250,19 @@ def normalize_event(data):
             alert_type = "SWING_EXIT"
         else:
             alert_type = "SWING_UNKNOWN"
+
+    # Precision Entry
+    elif alert_type == "PRECISION_ENTRY_MASTER":
+        if code in ("1", "1.0"):
+            alert_type = "ENTRY_VWAP_RECLAIM"
+        elif code in ("2", "2.0"):
+            alert_type = "ENTRY_EMA_BOUNCE"
+        elif code in ("3", "3.0"):
+            alert_type = "ENTRY_RANGE_BREAKOUT"
+        elif code in ("4", "4.0"):
+            alert_type = "EXIT_INTRADAY"
+        else:
+            alert_type = "ENTRY_UNKNOWN"
 
     return {
         "symbol": symbol,
@@ -238,10 +276,9 @@ def normalize_event(data):
 
 
 # =========================
-# SCANNER STATE + RANKING
+# SCANNER STATE
 # =========================
-
-def _new_scanner_record(price, now):
+def new_scanner_record(price, now):
     return {
         "hits": deque(),
         "activity_score": 0,
@@ -263,37 +300,17 @@ def scanner_score(rec):
     )
 
 
-def refresh_rankings():
-    global cached_ranked, cached_top_symbols, cached_top_symbol_set
-
-    cached_ranked = sorted(
-        scanner_state.items(),
-        key=lambda x: (
-            scanner_score(x[1]),
-            x[1]["last"],
-        ),
-        reverse=True,
-    )
-
-    cached_top_symbols = [symbol for symbol, _ in cached_ranked[:TOP_N]]
-    cached_top_symbol_set = set(cached_top_symbols)
-
-
 def prune_scanner_state(now=None):
     now = now or utc_now()
     cutoff = now - timedelta(minutes=ROLLING_WINDOW_MINUTES)
-    changed = False
+
     remove = []
 
-    for symbol, rec in list(scanner_state.items()):
+    for symbol, rec in scanner_state.items():
         while rec["hits"] and rec["hits"][0] < cutoff:
             rec["hits"].popleft()
-            changed = True
 
-        new_activity = len(rec["hits"])
-        if rec["activity_score"] != new_activity:
-            rec["activity_score"] = new_activity
-            changed = True
+        rec["activity_score"] = len(rec["hits"])
 
         if (
             rec["activity_score"] == 0
@@ -305,54 +322,50 @@ def prune_scanner_state(now=None):
 
     for symbol in remove:
         del scanner_state[symbol]
-        changed = True
-
-    if changed:
-        refresh_rankings()
 
 
-def get_ranked():
+def get_ranked_scanner():
     with scanner_lock:
         prune_scanner_state()
-        return list(cached_ranked)
+        return sorted(
+            scanner_state.items(),
+            key=lambda x: (scanner_score(x[1]), x[1]["last"]),
+            reverse=True,
+        )
 
 
-def get_top_symbols():
-    with scanner_lock:
-        prune_scanner_state()
-        return list(cached_top_symbols)
+def update_daily_focus_from_scanner():
+    global daily_focus_symbols
 
+    reset_daily_focus_if_needed()
 
-def in_top(symbol):
-    with scanner_lock:
-        prune_scanner_state()
-        return symbol in cached_top_symbol_set
+    ranked = get_ranked_scanner()
+    daily_focus_symbols = set([symbol for symbol, _ in ranked[:DAILY_TOP_N]])
+
+    return list(daily_focus_symbols)
 
 
 def update_scanner_state(event):
     now = utc_now()
     symbol = event["symbol"]
     alert_type = event["type"]
-    price = event["price"]
 
     with scanner_lock:
         prune_scanner_state(now)
 
         if symbol not in scanner_state:
-            scanner_state[symbol] = _new_scanner_record(price, now)
+            scanner_state[symbol] = new_scanner_record(event["price"], now)
 
         rec = scanner_state[symbol]
-        rec["price"] = price
+        rec["price"] = event["price"]
         rec["last"] = now.isoformat()
 
         if alert_type == "SCANNER_TOP_STOCK":
             rec["hits"].append(now)
-            rec["activity_score"] = len(rec["hits"])
             rec["quality_score"] = max(rec["quality_score"], 1)
 
         elif alert_type == "SCANNER_ELITE_STOCK":
             rec["hits"].append(now)
-            rec["activity_score"] = len(rec["hits"])
             rec["quality_score"] = max(rec["quality_score"], 2)
 
         elif alert_type == "PREMARKET_TOP":
@@ -367,7 +380,7 @@ def update_scanner_state(event):
         elif alert_type == "EARLY_LEADER":
             rec["early_leader_score"] = 1
 
-        refresh_rankings()
+        rec["activity_score"] = len(rec["hits"])
 
 
 def send_scanner_summary_if_due(force=False):
@@ -378,33 +391,32 @@ def send_scanner_summary_if_due(force=False):
     if not force and now - last_scanner_summary_sent < SCANNER_SUMMARY_INTERVAL_SECONDS:
         return
 
-    ranked = get_ranked()
+    ranked = get_ranked_scanner()
 
     if not ranked:
         return
 
+    focus = update_daily_focus_from_scanner()
+    focus_ranked = [(s, r) for s, r in ranked if s in focus]
+
     lines = [
-        "Scanner Ranked Summary",
+        "Top 3 Daily Focus Stocks",
         f"Generated: {ny_now_str()}",
         "",
-        "Top Ranked Stocks",
     ]
 
-    top3_symbols = update_daily_top3_from_scanner()
-    top3_ranked = [(s, r) for s, r in ranked if s in top3_symbols]
-
-    for i, (symbol, rec) in enumerate(top3_ranked, 1):
+    for i, (symbol, rec) in enumerate(focus_ranked, 1):
         tags = []
 
         if rec.get("premarket_tier"):
             tags.append(rec["premarket_tier"])
 
-        if rec.get("quality_score", 0) == 2:
+        if rec.get("quality_score") == 2:
             tags.append("ELITE")
-        elif rec.get("quality_score", 0) == 1:
+        elif rec.get("quality_score") == 1:
             tags.append("TOP")
 
-        if rec.get("early_leader_score", 0) == 1:
+        if rec.get("early_leader_score") == 1:
             tags.append("EARLY_LEADER")
 
         tag_text = ", ".join(tags) if tags else "TRACKED"
@@ -416,10 +428,8 @@ def send_scanner_summary_if_due(force=False):
 
     lines.extend([
         "",
-        "Score model:",
-        "Premarket Elite/Top + Scanner Elite/Top + Early Leader + Activity",
-        "",
-        "Use this as ranking/watchlist guidance, not automatic buy.",
+        "Only focus on these top 3 unless a new summary changes the list.",
+        "No trade is valid if the daily chart fails your checklist.",
     ])
 
     enqueue_email("Top 3 Daily Focus Stocks", "\n".join(lines))
@@ -427,40 +437,39 @@ def send_scanner_summary_if_due(force=False):
 
 
 # =========================
-# SWING STATE + RANKING
+# SWING / ELITE STATE
 # =========================
-
 def swing_signal_score(alert_type):
-    if alert_type == "SWING_BREAKOUT":
-        return 90
-    if alert_type == "SWING_BUY":
-        return 85
-    if alert_type == "SWING_WARNING":
-        return 45
-    if alert_type == "SWING_EXIT":
-        return 10
-    return 0
+    scores = {
+        "ELITE_SWING": 100,
+        "SWING_BREAKOUT": 90,
+        "SWING_BUY": 85,
+        "SWING_WATCH": 50,
+        "SWING_WARNING": 45,
+        "SWING_EXIT": 10,
+        "SWING_AVOID": -100,
+    }
+    return scores.get(alert_type, 0)
 
 
 def swing_status(alert_type):
-    if alert_type == "SWING_BREAKOUT":
-        return "BREAKOUT"
-    if alert_type == "SWING_BUY":
-        return "BUY ZONE"
-    if alert_type == "SWING_WARNING":
-        return "WARNING"
-    if alert_type == "SWING_EXIT":
-        return "EXIT"
-    return "UNKNOWN"
+    statuses = {
+        "ELITE_SWING": "ELITE",
+        "SWING_BREAKOUT": "BREAKOUT",
+        "SWING_BUY": "BUY ZONE",
+        "SWING_WATCH": "WATCH",
+        "SWING_WARNING": "WARNING",
+        "SWING_EXIT": "EXIT",
+        "SWING_AVOID": "AVOID",
+    }
+    return statuses.get(alert_type, "UNKNOWN")
 
 
 def update_swing_state(event):
     symbol = event["symbol"]
     pine_score = safe_float(event["raw"].get("score", 0))
     signal_score = swing_signal_score(event["type"])
-
-    # Combined score: Pine quality first, then signal strength
-    combined_score = pine_score * 10 + signal_score
+    total_score = pine_score * 10 + signal_score
 
     with swing_lock:
         old = swing_state.get(symbol, {})
@@ -471,7 +480,7 @@ def update_swing_state(event):
             "status": swing_status(event["type"]),
             "pine_score": pine_score,
             "signal_score": signal_score,
-            "score": combined_score,
+            "score": total_score,
             "price": event["price"],
             "alert_time_ny": event["alert_time_ny"],
             "received_time_ny": event["received_time_ny"],
@@ -480,20 +489,11 @@ def update_swing_state(event):
         }
 
 
-def get_swing_state_snapshot():
-    with swing_lock:
-        return dict(swing_state)
-
-
 def get_ranked_swing():
     with swing_lock:
         return sorted(
             swing_state.values(),
-            key=lambda x: (
-                x.get("score", 0),
-                x.get("count", 0),
-                x.get("received_time_ny", ""),
-            ),
+            key=lambda x: (x.get("score", 0), x.get("count", 0), x.get("received_time_ny", "")),
             reverse=True,
         )
 
@@ -512,54 +512,138 @@ def send_swing_summary_if_due(force=False):
         return
 
     lines = [
-        "Swing Trading Summary",
+        "Top Swing Candidates",
         f"Generated: {ny_now_str()}",
         "",
-        "Top Swing Candidates / Alerts",
     ]
 
     for i, rec in enumerate(ranked[:DAILY_TOP_N], 1):
         lines.append(
             f"{i}. {rec['symbol']} | {rec['status']} | "
-            f"Total Score: {rec['score']:.1f} | "
-            f"Pine Score: {rec.get('pine_score', 0):.1f} | "
-            f"Signal Score: {rec.get('signal_score', 0)} | "
-            f"Price: {rec['price']} | Count: {rec['count']} | "
-            f"Last: {rec['received_time_ny']}"
+            f"Total: {rec['score']:.1f} | Pine: {rec['pine_score']:.1f} | "
+            f"Signal: {rec['signal_score']} | Price: {rec['price']} | Count: {rec['count']}"
         )
 
     lines.extend([
         "",
-        "Score meaning:",
-        "Pine Score = Daily+Weekly swing quality from TradingView V3",
-        "Signal Score: 90 breakout, 85 buy zone, 45 warning, 10 exit",
-        "Total Score = Pine Score × 10 + Signal Score",
-        "",
-        "Use this as swing watchlist ranking, not automatic buy/sell.",
+        "Use this as your daily candidate list, not automatic buy/sell.",
     ])
 
-    enqueue_email("Swing Trading Summary", "\n".join(lines))
+    enqueue_email("Top Swing Candidates", "\n".join(lines))
     last_swing_summary_sent = now
 
 
 # =========================
-# EMAIL TEMPLATES
+# PRECISION ENTRY STATE
 # =========================
+def precision_signal_score(alert_type):
+    scores = {
+        "ENTRY_RANGE_BREAKOUT": 90,
+        "ENTRY_EMA_BOUNCE": 85,
+        "ENTRY_VWAP_RECLAIM": 80,
+        "EXIT_INTRADAY": -100,
+    }
+    return scores.get(alert_type, 0)
 
+
+def precision_status(alert_type):
+    statuses = {
+        "ENTRY_RANGE_BREAKOUT": "RANGE BREAKOUT",
+        "ENTRY_EMA_BOUNCE": "EMA BOUNCE",
+        "ENTRY_VWAP_RECLAIM": "VWAP RECLAIM",
+        "EXIT_INTRADAY": "EXIT",
+    }
+    return statuses.get(alert_type, "UNKNOWN")
+
+
+def update_entry_state(event):
+    symbol = event["symbol"]
+    pine_score = safe_float(event["raw"].get("score", 0))
+    signal_score = precision_signal_score(event["type"])
+    total_score = pine_score * 10 + signal_score
+
+    with entry_lock:
+        old = entry_state.get(symbol, {})
+
+        entry_state[symbol] = {
+            "symbol": symbol,
+            "last_signal": event["type"],
+            "status": precision_status(event["type"]),
+            "pine_score": pine_score,
+            "signal_score": signal_score,
+            "score": total_score,
+            "price": event["price"],
+            "alert_time_ny": event["alert_time_ny"],
+            "received_time_ny": event["received_time_ny"],
+            "count": int(old.get("count", 0)) + 1,
+            "raw": event["raw"],
+        }
+
+
+def get_ranked_entries():
+    with entry_lock:
+        return sorted(
+            entry_state.values(),
+            key=lambda x: (x.get("score", 0), x.get("count", 0), x.get("received_time_ny", "")),
+            reverse=True,
+        )
+
+
+def send_entry_summary_if_due(force=False):
+    global last_entry_summary_sent
+
+    now = time.time()
+
+    if not force and now - last_entry_summary_sent < ENTRY_SUMMARY_INTERVAL_SECONDS:
+        return
+
+    ranked = get_ranked_entries()
+
+    if not ranked:
+        return
+
+    reset_daily_focus_if_needed()
+
+    # Only show entries that are in daily Top 3, unless focus list is empty.
+    if daily_focus_symbols:
+        ranked = [r for r in ranked if r["symbol"] in daily_focus_symbols]
+
+    if not ranked:
+        return
+
+    lines = [
+        "Top Precision Entries",
+        f"Generated: {ny_now_str()}",
+        "",
+    ]
+
+    for i, rec in enumerate(ranked[:DAILY_TOP_N], 1):
+        lines.append(
+            f"{i}. {rec['symbol']} | {rec['status']} | "
+            f"Total: {rec['score']:.1f} | Pine: {rec['pine_score']:.1f} | "
+            f"Signal: {rec['signal_score']} | Price: {rec['price']} | Count: {rec['count']}"
+        )
+
+    lines.extend([
+        "",
+        "Only take entries if daily chart still passes your checklist.",
+    ])
+
+    enqueue_email("Top Precision Entries", "\n".join(lines))
+    last_entry_summary_sent = now
+
+
+# =========================
+# FALLBACK EVENT EMAIL
+# =========================
 def email_for_event(event):
-    t = event["type"]
-    s = event["symbol"]
-    p = event["price"]
-    at = event["alert_time_ny"]
-    rt = event["received_time_ny"]
-
     return (
-        f"{t.replace('_', ' ')} - {s}",
-        f"{t}\n\n"
-        f"Symbol: {s}\n"
-        f"Price: {p}\n"
-        f"Alert Time: {at}\n"
-        f"Received: {rt}\n\n"
+        f"{event['type']} - {event['symbol']}",
+        f"{event['type']}\n\n"
+        f"Symbol: {event['symbol']}\n"
+        f"Price: {event['price']}\n"
+        f"Alert Time: {event['alert_time_ny']}\n"
+        f"Received: {event['received_time_ny']}\n\n"
         f"Raw:\n{json.dumps(event['raw'], indent=2)}"
     )
 
@@ -567,7 +651,6 @@ def email_for_event(event):
 # =========================
 # ROUTING
 # =========================
-
 SCANNER_TYPES = {
     "PREMARKET_TOP",
     "PREMARKET_ELITE",
@@ -576,10 +659,23 @@ SCANNER_TYPES = {
     "EARLY_LEADER",
 }
 
-ENTRY_TYPES = {
-    "ENTRY_READY",
-    "ENTRY_LONG",
-    "ELITE_EARLY",
+SWING_TYPES = {
+    "ELITE_SWING",
+    "SWING_WATCH",
+    "SWING_AVOID",
+    "SWING_BUY",
+    "SWING_BREAKOUT",
+    "SWING_WARNING",
+    "SWING_EXIT",
+    "SWING_UNKNOWN",
+}
+
+PRECISION_ENTRY_TYPES = {
+    "ENTRY_VWAP_RECLAIM",
+    "ENTRY_EMA_BOUNCE",
+    "ENTRY_RANGE_BREAKOUT",
+    "EXIT_INTRADAY",
+    "ENTRY_UNKNOWN",
 }
 
 MANAGEMENT_TYPES = {
@@ -595,26 +691,25 @@ MANAGEMENT_TYPES = {
     "LATE_DAY_RISK_OFF",
 }
 
-SWING_TYPES = {
-    "SWING_BUY",
-    "SWING_BREAKOUT",
-    "SWING_WARNING",
-    "SWING_EXIT",
-    "SWING_UNKNOWN",
-}
-
 
 def handle_scanner_event(event):
     update_scanner_state(event)
     send_scanner_summary_if_due(force=False)
 
 
-def handle_entry_event(event):
-    if in_top(event["symbol"]):
-        subject, body = email_for_event(event)
-        enqueue_email(subject, body)
-    else:
-        print(f"[FILTERED {event['type']}] {event['symbol']} not in Top {TOP_N}", flush=True)
+def handle_swing_event(event):
+    # No swing emails after market close.
+    if not market_hours_now():
+        print("[SWING BLOCKED OUTSIDE MARKET HOURS]", event["symbol"], flush=True)
+        return
+
+    update_swing_state(event)
+    send_swing_summary_if_due(force=False)
+
+
+def handle_precision_entry_event(event):
+    update_entry_state(event)
+    send_entry_summary_if_due(force=False)
 
 
 def handle_management_event(event):
@@ -622,26 +717,17 @@ def handle_management_event(event):
     enqueue_email(subject, body)
 
 
-def handle_swing_event(event):
-    update_swing_state(event)
-
-    if is_market_email_window():
-        send_swing_summary_if_due(force=False)
-    else:
-        print(f"[SWING EMAIL HELD OUTSIDE MARKET HOURS] {event['symbol']} {event['type']}", flush=True)
-
-
 def route_event(event):
     t = event["type"]
 
     if t in SCANNER_TYPES:
         handle_scanner_event(event)
-    elif t in ENTRY_TYPES:
-        handle_entry_event(event)
-    elif t in MANAGEMENT_TYPES:
-        handle_management_event(event)
     elif t in SWING_TYPES:
         handle_swing_event(event)
+    elif t in PRECISION_ENTRY_TYPES:
+        handle_precision_entry_event(event)
+    elif t in MANAGEMENT_TYPES:
+        handle_management_event(event)
     else:
         subject, body = email_for_event(event)
         enqueue_email(subject, body)
@@ -671,7 +757,6 @@ threading.Thread(target=event_worker, daemon=True).start()
 # =========================
 # ROUTES
 # =========================
-
 @app.route("/")
 def home():
     return "running"
@@ -681,19 +766,17 @@ def home():
 def health():
     return {
         "time_ny": ny_now_str(),
-        "top_symbols": get_top_symbols(),
-        "tracked_scanner": len(get_ranked()),
-        "tracked_swing": len(get_swing_state_snapshot()),
+        "market_hours": market_hours_now(),
+        "daily_focus_symbols": list(daily_focus_symbols),
+        "scanner_count": len(scanner_state),
+        "swing_count": len(swing_state),
+        "entry_count": len(entry_state),
         "event_queue_size": event_queue.qsize(),
         "email_queue_size": email_queue.qsize(),
         "scanner_summary_interval_seconds": SCANNER_SUMMARY_INTERVAL_SECONDS,
         "swing_summary_interval_seconds": SWING_SUMMARY_INTERVAL_SECONDS,
+        "entry_summary_interval_seconds": ENTRY_SUMMARY_INTERVAL_SECONDS,
     }
-
-
-@app.route("/scanner-state")
-def scanner_state_route():
-    return {symbol: rec for symbol, rec in get_ranked()}
 
 
 @app.route("/scanner-summary")
@@ -702,15 +785,31 @@ def scanner_summary_route():
     return {"ok": True, "message": "scanner summary queued"}
 
 
-@app.route("/swing-state")
-def swing_state_route():
-    return get_swing_state_snapshot()
-
-
 @app.route("/swing-summary")
 def swing_summary_route():
     send_swing_summary_if_due(force=True)
     return {"ok": True, "message": "swing summary queued"}
+
+
+@app.route("/entry-summary")
+def entry_summary_route():
+    send_entry_summary_if_due(force=True)
+    return {"ok": True, "message": "entry summary queued"}
+
+
+@app.route("/scanner-state")
+def scanner_state_route():
+    return {symbol: rec for symbol, rec in get_ranked_scanner()}
+
+
+@app.route("/swing-state")
+def swing_state_route():
+    return {"items": get_ranked_swing()}
+
+
+@app.route("/entry-state")
+def entry_state_route():
+    return {"items": get_ranked_entries()}
 
 
 @app.route("/test-email")
@@ -770,4 +869,5 @@ def webhook():
 if __name__ == "__main__":
     validate_env()
     ensure_csv()
+    reset_daily_focus_if_needed()
     app.run(host="0.0.0.0", port=PORT)
